@@ -19,4 +19,5 @@ run 1b-construction-noalloc cargo test --profile release-debug --test local_stan
 run 2-route-simulation    cargo test --manifest-path program-template/Cargo.toml --release --test local_stand_route -- --nocapture
 run 3-real-routed-txs     cargo test --release --test local_stand_matrix -- --nocapture --test-threads=1 real_routed
 run 4-dynamic-sequences   cargo test --release --test local_stand_matrix -- --nocapture --test-threads=1 dynamic_
+run 5-range-manager       cargo test --release --test local_stand_range_manager -- --nocapture --test-threads=1
 exit $rc

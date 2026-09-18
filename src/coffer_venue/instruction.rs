@@ -20,6 +20,12 @@ pub const SET_TOKEN_ACTIVE_DISCRIMINATOR: [u8; 8] = [0, 158, 202, 35, 50, 139, 2
 pub const SET_SWAPS_ENABLED_DISCRIMINATOR: [u8; 8] = [144, 154, 205, 58, 241, 169, 64, 40];
 pub const SET_POOL_ENABLED_DISCRIMINATOR: [u8; 8] = [53, 76, 170, 37, 55, 222, 63, 21];
 pub const INITIALIZE_POOL_ALT_DISCRIMINATOR: [u8; 8] = [251, 135, 66, 2, 244, 73, 12, 144];
+pub const REMOVE_LIQUIDITY_DISCRIMINATOR: [u8; 8] = [80, 85, 209, 72, 24, 206, 177, 108];
+/// Range-manager role: appoint / gate the manager (pool admin), set its
+/// envelope (pool admin), and the manager's own update instruction.
+pub const SET_RANGE_MANAGER_DISCRIMINATOR: [u8; 8] = [103, 102, 173, 112, 8, 2, 37, 132];
+pub const SET_RANGE_MANAGER_CONFIG_DISCRIMINATOR: [u8; 8] = [103, 211, 0, 200, 164, 189, 245, 205];
+pub const RANGE_MANAGER_UPDATE_DISCRIMINATOR: [u8; 8] = [245, 183, 35, 69, 200, 10, 172, 44];
 /// The `PoolConfig` account discriminator.
 pub const POOL_CONFIG_DISCRIMINATOR: [u8; 8] = [4, 29, 243, 10, 142, 64, 232, 118];
 /// Event discriminators (`Swap`, `PoolStateLog`, `MaxSelloffWindowAdvanced`,
@@ -125,7 +131,23 @@ mod tests {
             }
             out
         }
-        let pins: [([u8; 8], &str); 15] = [
+        let pins: [([u8; 8], &str); 19] = [
+            (
+                REMOVE_LIQUIDITY_DISCRIMINATOR,
+                "5055d14818ceb16cf9c1af8135806f39dab656fb1544152be2c17bf6b7fbf3cb",
+            ),
+            (
+                SET_RANGE_MANAGER_DISCRIMINATOR,
+                "6766ad7008022584e53f933b48c967bf79adcda5e9081599eee863419e3cec44",
+            ),
+            (
+                SET_RANGE_MANAGER_CONFIG_DISCRIMINATOR,
+                "67d300c8a4bdf5cd02ff794ae87c430adc0c8dc3fb136d1e1490e08fad71e889",
+            ),
+            (
+                RANGE_MANAGER_UPDATE_DISCRIMINATOR,
+                "f5b72345c80aac2cd4b848139466478a947017a442bf5be86cbdb8dac69672b4",
+            ),
             (
                 SWAP_DISCRIMINATOR,
                 "f8c69e91e17587c865d4b6c9797e9bd686812d717055b6117a16f83991b4e8a7",

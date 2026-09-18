@@ -61,6 +61,10 @@ const SHORT: SelloffParams = SelloffParams::new(1_000, 20, 5_000, 0, 2_000, 5_00
 const J: SelloffParams = SelloffParams::new(0, 0, 5_000, 100, 500, 3_000, 75);
 const M_BONK: SelloffParams = SelloffParams::new(1_000, H, 5_000, 0, 1_000, 3_000, 70);
 const M_T22: SelloffParams = SelloffParams::new(500, H, 8_000, 0, 0, 5_000, 0);
+/// Range-manager scenarios: a 30 s window with a surge curve (real-time
+/// rotations under vb/weight moves), and a moderate curve for the leverage case.
+const RM_SHORT: SelloffParams = SelloffParams::new(1_000, 30, 5_000, 0, 2_000, 5_000, 80);
+const RM_LEV: SelloffParams = SelloffParams::new(1_000, H, 5_000, 0, 1_000, 3_000, 70);
 
 const TWO: &[&str] = &["BONK", "USDC"];
 const FOUR: &[&str] = &["SOLX", "BONK", "USDC", "MEME22"];
@@ -372,6 +376,79 @@ const CASES: &[Case] = &[
     Case {
         id: "dyn_router",
         description: "dynamic: config b, chunked sells through the router",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[B, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    // range-manager / admin scenarios (tests/local_stand_range_manager.rs)
+    Case {
+        id: "rm_short",
+        description: "range manager: 30 s window, cap 10%, thr 50%, 0/20/50%, kink 80 — vb moves mid-window, rotation, no-refresh execution",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[RM_SHORT, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    Case {
+        id: "rm_w_surge",
+        description: "range manager: weight moves 50/50 -> 55/45 -> 45/55 with config b (surge)",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[B, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    Case {
+        id: "rm_w_cap",
+        description: "range manager: weight moves 50/50 -> 55/45 -> 45/55 with the cap only (no surge)",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[CAP_ONLY, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    Case {
+        id: "rm_lev",
+        description: "range manager: USDC vb pushed to 16x so the LP balance caps output before the window, then back",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[RM_LEV, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    Case {
+        id: "rm_cfg",
+        description: "admin: set_max_selloff reconfigured between quotes (cap raised / lowered / curve changed / disabled / re-enabled)",
+        weights: &[5_000, 5_000],
+        tokens: TWO,
+        swap_fee_rate: 3_000,
+        selloff: &[B, OFF],
+        inactive: &[],
+        swaps_enabled: true,
+        pool_enabled: true,
+        dynamic: true,
+    },
+    Case {
+        id: "rm_liq",
+        description: "admin: add_liquidity / remove_liquidity between quotes (window rescale)",
         weights: &[5_000, 5_000],
         tokens: TWO,
         swap_fee_rate: 3_000,

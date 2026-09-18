@@ -243,16 +243,21 @@ below the virtual balance). The route simulation uses `5dDez…` and `BN4wp…`.
   by construction); `price` is the derivative of the continuous model. The
   residual beyond the fee-rounding slack measured 7.3e-5 on the worst fixture
   (`pricing_invariants_under_surge_with_residual_report`).
-- The window arithmetic uses the Clock sysvar captured at `update_state`; a
-  stale clock near a window boundary makes the off-chain window position differ
-  from the leader's. Refresh the clock with the pool.
+- The window arithmetic uses the Clock sysvar captured at `update_state` (the
+  sysvar is in `get_required_pubkeys_for_update`, so it refreshes with the
+  pool). Without a refresh between the quote and the landing block, the
+  execution differs from the quote only through the window position, and only
+  in one direction is that unsafe — see "Clock staleness" below.
 - Overflow of the vault *token account* (`vault + amount_in > u64::MAX`) is not
   predicted from pool state alone; it needs more than `2^64 - vault` atoms.
 - `parse_pool_creations` targets the `main` instruction shape (mints in
   `remaining_accounts`); pre-upgrade creations that passed a `tokens` vector
   are not recognised.
-- Inactive tokens can still be bought; sidelined tokens (`actual_balance ==
-  0`) are excluded as outputs from `directions_num`.
+- `directions_num` is STRUCTURAL: every ordered pair of the pool's slots,
+  regardless of the pool's mutable state. A deactivated input token, an
+  exhausted sell-off window or a sidelined output token are answered by
+  `quote` (contract error / zero fillable atoms) and by `bounds` (no quotable
+  range), never by dropping the pair — see "Declared directions" below.
 
 ### Local-validator matrix (sell-off window + surge fee, end to end)
 
@@ -268,11 +273,12 @@ configured with the local wallet as pool admin — and writes
 
 ```bash
 make build-program                 # router ELF for the validator
-scripts/local-stand/up.sh          # validator + mints + 26 pools (~2 min); prints the addresses
-scripts/local-stand/run-matrix.sh  # tiers 1-4 in order, logs in scripts/local-stand/logs/
+scripts/local-stand/up.sh          # validator + mints + 32 pools (~2 min); prints the addresses
+scripts/local-stand/run-matrix.sh  # tiers 1-5 in order, logs in scripts/local-stand/logs/
 ```
 
-Tiers (`tests/local_stand_matrix.rs`, `program-template/.../tests/local_stand_route.rs`):
+Tiers (`tests/local_stand_matrix.rs`, `program-template/.../tests/local_stand_route.rs`,
+`tests/local_stand_range_manager.rs`; shared helpers in `tests/stand/mod.rs`):
 
 1. Titan's shared suite (all eight tests) on every static pool, plus
    `construction` under the allocation guard;
@@ -287,7 +293,12 @@ Tiers (`tests/local_stand_matrix.rs`, `program-template/.../tests/local_stand_ro
    program reverts with `MaxSelloffExceeded`, buy side unaffected, surge fee
    accrual in the output token's protocol bucket, the 100%-fee exhaustion
    point, real-time rotation on a 20-second window, and the
-   `set_token_active` / `set_swaps_enabled` / `set_pool_enabled` toggles.
+   `set_token_active` / `set_swaps_enabled` / `set_pool_enabled` toggles;
+5. pool state changing UNDER the venue (`rm_*` pools): the range manager
+   moving virtual balances and weights, the admin reconfiguring
+   `set_max_selloff`, `add_liquidity` / `remove_liquidity`, and executions
+   without a refresh across a window rotation — see "Range manager and admin
+   changes" below.
 
 Configuration matrix (BONK is slot 0 and capped; `(cap, period, threshold,
 low/mid/high, kink)`; see `CASES` in `src/bin/local_stand.rs`):
@@ -310,6 +321,10 @@ low/mid/high, kink)`; see `CASES` in `src/bin/local_stand.rs`):
 | w8020_b / w8020_c | 80/20 | configs b / c |
 | m_four_token | SOL/BONK/USDC/MEME22 | BONK cap 10% thr 50% 0/10/30% kink 70; MEME22 (Token-2022) cap 5% thr 80% 0/0/50% |
 | dyn_* | 50/50, 80/20 | dedicated copies of b, c, d, the 20 s pool and b for the sequence tests |
+| rm_short | 50/50 | cap 10%, period 30 s, thr 50%, 0/20/50%, kink 80 — vb moves, rotation, stale execution |
+| rm_w_surge / rm_w_cap | 50/50 | config b / cap only — weight moves |
+| rm_lev | 50/50 | cap 10%, thr 50%, 0/10/30%, kink 70 — USDC vb pushed to 16× |
+| rm_cfg / rm_liq | 50/50 | config b — `set_max_selloff` reconfiguration / liquidity add + remove |
 
 Results of the last clean run (`scripts/local-stand/results/`, reproduced by
 `up.sh && run-matrix.sh`; 26 pools, 4 mints):
@@ -320,6 +335,73 @@ Results of the last clean run (`scripts/local-stand/results/`, reproduced by
 | 2 route simulation | 19/19 pools, every direction, 430 legs exact |
 | 3 real routed txs | 126 `swap_route_v3` transactions on the validator, 126 exact against the quote AND the predicted pool account (one, on the 20 s pool, exact once the venue clock is set to the block time); `l_swaps_off` / `l_pool_off`: quote refuses, program reverts 6021 / 6020; `k_inactive`: BONK direction absent, selling reverts 6054, buying exact; max 284 428 CU per routed tx with the surge active |
 | 4 dynamic | windows filled in chunks on b / c / 80-20 c (direct) and b (routed, 10 chunks crossing the kink) with every chunk exact; full window → direction absent, `bounds` errors, quote reports 0 fillable, program reverts `MaxSelloffExceeded`, buy side exact; surge accrual in the USDC protocol bucket equals the sum of the predicted per-chunk fees (2 194 516 753 atoms on b); 100%-fee config: exhaustion point executed exactly, selling past it pays 0 on-chain; 20 s window: fill, rotate after one period (carry-over headroom sold exactly), fresh cap after two; deactivate / swaps-off / pool-off toggles behave as quoted and revert 6054 / 6021 / 6020 |
+
+### Range manager and admin changes (state moving under the venue)
+
+A pool's `pool_admin` and its appointed `range_manager` can rewrite, between
+any two refreshes, everything a quote depends on: `range_manager_update`
+moves `virtual_balance` and/or `normalized_weight` of chosen slots in one
+instruction (bounded per step, compare-and-swap guarded, cooldown, optional
+leverage band); `set_max_selloff` replaces the caps and surge curves;
+`set_token_active` / `set_swaps_enabled` / `set_pool_enabled` flip kill
+switches; `add_liquidity` / `remove_liquidity` scale balances AND the window.
+Tier 5 (`tests/local_stand_range_manager.rs`) drives every one of these on the
+validator and asserts exact parity after each move. The review conclusions:
+
+- **State freshness.** `update_state` re-reads the pool account, every mint
+  and the Clock sysvar on each refresh and rebuilds the per-direction curve
+  parameters (`rebuild_directions`) from that fresh pool; nothing used by
+  `quote` is cached across refreshes (no lazy fields; `Clone` is field-wise).
+  The only value fixed at construction is the token set
+  (`required_state_pubkeys`, `index_of`, `vault()`), which no instruction of
+  the contract can change after `initialize_pool`; `update_state` rejects a
+  pool whose mints differ from the ones it was built from.
+- **Declared directions.** `directions_num` returns every ordered pair of
+  slots and nothing else. Titan documents it as the venue's *declared*
+  directions, so a router may evaluate it once at registration; a filter on
+  mutable state (input token deactivated, window exhausted, output slot
+  unseeded) would then permanently drop a direction that was merely paused
+  when the venue was registered. Declaring a paused direction costs nothing:
+  `bounds` reports no quotable range, `quote` returns the contract's error
+  (`TokenInactive`, `InactivePoolError`) or a partial fill of zero atoms, and
+  the direction quotes again as soon as the state allows. (Titan's shared
+  suite assumes every declared direction quotes; the stand runs it through
+  `local_stand::QuotableDirections` on the one pool with a deactivated token
+  and asserts the paused direction explicitly.)
+- **Range manager and the sell-off window.** The quote runs the contract's own
+  `check_and_advance` on a copy of the live row. After a
+  `range_manager_update` the cap therefore stays `max_selloff_pct × old
+  snapshot` (`selloff_vb_snapshot` is not rescaled by the manager — the
+  accepted contract residual, audit L-14) and the surge fill is measured
+  against that cap; at the next rotation the snapshot becomes the moved
+  `virtual_balance` and the carry-over is rescaled by `new / old`, exactly as
+  on-chain (asserted byte for byte on the post-swap account). A weight change
+  leaves the window untouched (fill accounting is in input atoms) and changes
+  the curve, the spot price (`w_in / w_out` enters the derivative) and the
+  surge segment outputs; all are recomputed from the refreshed pool.
+- **Partial fills.** A request beyond the window headroom now reports the
+  same fillable amount as a request AT the headroom: the `MaxSelloffExceeded`
+  path applies the same 100%-surge pull-back as the in-cap path, so the
+  reported amount never contains input atoms that buy nothing and its price
+  is positive (`partial_fill_above_headroom_stops_at_the_surge_exhaustion_point`).
+- **Clock staleness** (a quote at clock `t`, the transaction landing at
+  `t' > t` with no refresh in between). The pool state being unchanged, only
+  the window position differs: (a) inside a window the carry-over decays, the
+  fill falls, the surge rate falls — the execution pays at least the quote;
+  (b) across a rotation with the live `virtual_balance` at or above the
+  snapshot (the usual case: selling the token raises its vb) the accumulated
+  sells become a decaying carry-over on a larger cap — again at least the
+  quote; (c) across a rotation with the live `virtual_balance` BELOW the
+  snapshot — after buys of the token, an LP exit, or a range-manager cut — the
+  new cap is smaller, the same input lands at a higher fill, and the execution
+  pays LESS than quoted or reverts with `MaxSelloffExceeded`. Measured on the
+  stand (tier 5, `rm_short`, 30 s window): (b) quoted 183 226 263, received
+  295 706 408; (c) after the manager cut BONK's vb by 49%: quoted
+  4 258 847 305, received 4 033 198 947 (5.3% less). In every case the venue
+  math evaluated at the block time reproduces the execution exactly, i.e. the
+  residual is purely the clock: keep the Clock sysvar (already in
+  `get_required_pubkeys_for_update`) refreshed with the pool, and rely on the
+  route-level `minimum_amount_out` for the remaining slot-to-slot drift.
 
 Findings from the matrix:
 

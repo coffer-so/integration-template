@@ -25,403 +25,29 @@
 
 mod common;
 
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use common::SuiteConfig;
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::RpcTransactionConfig;
-use solana_instruction::Instruction;
-use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
-use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use solana_sdk::instruction::InstructionError;
-use solana_sdk::signature::Signature;
-use solana_sdk::signature::{Keypair, Signer, read_keypair_file};
-use solana_sdk::transaction::{Transaction, TransactionError};
-use solana_transaction_status_client_types::{
-    UiTransactionEncoding, option_serializer::OptionSerializer,
-};
-use spl_token::state::Account as TokenAccount;
+use solana_sdk::signature::Signer;
 
-use titan_integration_template::account_caching::rpc_cache::RpcClientCache;
 use titan_integration_template::coffer::errors::ErrorCode;
-use titan_integration_template::coffer::state::CofferPool;
-use titan_integration_template::coffer::swap::{apply_swap, quote_exact_in, selloff_headroom};
-use titan_integration_template::coffer_venue::{COFFER_PROGRAM_ID, CofferVenue};
+use titan_integration_template::coffer::swap::selloff_headroom;
+use titan_integration_template::coffer_venue::CofferVenue;
 use titan_integration_template::local_stand::*;
 use titan_integration_template::trading_venue::error::TradingVenueError;
-use titan_integration_template::trading_venue::{
-    FromAccount, QuoteRequest, QuoteResult, SwapType, TradingVenue,
-};
+use titan_integration_template::trading_venue::{QuoteRequest, SwapType, TradingVenue};
 
 // Allocation guard for the `construction` run under `--profile release-debug`.
 #[cfg(debug_assertions)]
 #[global_allocator]
 static A: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-// ---------------------------------------------------------------------------
-// Stand access
-// ---------------------------------------------------------------------------
-
-struct Stand {
-    manifest: StandManifest,
-    rpc: RpcClient,
-    wallet: Keypair,
-}
-
-async fn stand_or_skip(test: &str) -> Option<Stand> {
-    let Some(manifest) = StandManifest::load() else {
-        eprintln!(
-            "SKIP {test}: no {} — run scripts/local-stand/up.sh",
-            StandManifest::path().display()
-        );
-        return None;
-    };
-    let Ok(url) = std::env::var("SOLANA_RPC_URL") else {
-        eprintln!("SKIP {test}: set SOLANA_RPC_URL={}", manifest.rpc);
-        return None;
-    };
-    let rpc = RpcClient::new_with_commitment(url, CommitmentConfig::confirmed());
-    if rpc.get_health().await.is_err() {
-        eprintln!("SKIP {test}: local validator not reachable");
-        return None;
-    }
-    let wallet_path = std::env::var("LOCAL_STAND_WALLET")
-        .unwrap_or_else(|_| format!("{}/.config/solana/id.json", std::env::var("HOME").unwrap()));
-    let wallet = read_keypair_file(&wallet_path).expect("wallet keypair");
-    assert_eq!(
-        wallet.pubkey().to_string(),
-        manifest.wallet,
-        "wallet differs from the stand's pool admin"
-    );
-    Some(Stand {
-        manifest,
-        rpc,
-        wallet,
-    })
-}
-
-impl Stand {
-    fn pool(&self, case: &str) -> &StandPool {
-        self.manifest
-            .pools
-            .iter()
-            .find(|p| p.case == case)
-            .unwrap_or_else(|| panic!("pool {case} in manifest"))
-    }
-
-    fn mint(&self, name: &str) -> (Pubkey, Pubkey) {
-        let m = self.manifest.mint(name);
-        (
-            Pubkey::from_str(&m.address).unwrap(),
-            if m.token_2022 {
-                spl_token_2022::ID
-            } else {
-                spl_token::ID
-            },
-        )
-    }
-
-    /// Fresh venue from live state (fresh cache: no stale accounts).
-    async fn venue(&self, pool: Pubkey) -> CofferVenue {
-        let account = self.rpc.get_account(&pool).await.expect("pool account");
-        let mut venue = CofferVenue::from_account(&pool, &account).expect("from_account");
-        let cache = RpcClientCache::new(RpcClient::new_with_commitment(
-            self.manifest.rpc.clone(),
-            CommitmentConfig::confirmed(),
-        ));
-        venue.update_state(&cache).await.expect("update_state");
-        venue
-    }
-
-    async fn pool_state(&self, pool: Pubkey) -> CofferPool {
-        CofferPool::from_account_data(&self.rpc.get_account(&pool).await.unwrap().data).unwrap()
-    }
-
-    async fn token_balance(&self, mint: &Pubkey, tp: &Pubkey) -> u64 {
-        let key = ata(&self.wallet.pubkey(), mint, tp);
-        match self.rpc.get_account(&key).await {
-            Ok(acc) => TokenAccount::unpack_from_slice(&acc.data)
-                .map(|a| a.amount)
-                .unwrap_or(0),
-            Err(_) => 0,
-        }
-    }
-
-    /// Send and confirm; on failure return the program's custom error code.
-    async fn send(&self, ixs: &[Instruction]) -> Result<Signature, u32> {
-        let bh = self.rpc.get_latest_blockhash().await.unwrap();
-        let tx = Transaction::new_signed_with_payer(
-            ixs,
-            Some(&self.wallet.pubkey()),
-            &[&self.wallet],
-            bh,
-        );
-        match self.rpc.send_and_confirm_transaction(&tx).await {
-            Ok(sig) => Ok(sig),
-            Err(e) => match e.get_transaction_error() {
-                Some(TransactionError::InstructionError(_, InstructionError::Custom(code))) => {
-                    Err(code)
-                }
-                other => panic!("transaction failed without a custom code: {other:?} / {e}"),
-            },
-        }
-    }
-
-    /// `(block_time, compute_units_consumed)` of a confirmed transaction.
-    async fn tx_meta(&self, sig: &Signature) -> (i64, u64) {
-        let tx = self
-            .rpc
-            .get_transaction_with_config(
-                sig,
-                RpcTransactionConfig {
-                    encoding: Some(UiTransactionEncoding::Json),
-                    commitment: Some(CommitmentConfig::confirmed()),
-                    max_supported_transaction_version: Some(0),
-                },
-            )
-            .await
-            .expect("confirmed transaction");
-        let cu = tx
-            .transaction
-            .meta
-            .and_then(|m| match m.compute_units_consumed {
-                OptionSerializer::Some(v) => Some(v),
-                _ => None,
-            })
-            .unwrap_or_default();
-        (tx.block_time.unwrap_or(0), cu)
-    }
-
-    fn request(&self, venue: &CofferVenue, i: u8, j: u8, amount: u64) -> QuoteRequest {
-        QuoteRequest {
-            input_mint: venue.get_token(i as usize).unwrap().pubkey,
-            output_mint: venue.get_token(j as usize).unwrap().pubkey,
-            amount,
-            swap_type: SwapType::ExactIn,
-        }
-    }
-
-    /// Execute one swap for real (routed through the Titan router when
-    /// `routed`, else the venue's own `swap` instruction) and compare the
-    /// user's output delta and the post-swap pool account with the venue's
-    /// prediction. When they differ, the quote is recomputed with the venue's
-    /// clock set to the transaction's block time: the sell-off window is a
-    /// function of the clock, so a rotation or carry-over decay between the
-    /// quote and the landing block explains a difference exactly.
-    async fn parity_swap(
-        &self,
-        venue: &CofferVenue,
-        i: u8,
-        j: u8,
-        amount: u64,
-        routed: bool,
-    ) -> Parity {
-        let request = self.request(venue, i, j, amount);
-        let quote = venue.quote(request.clone()).expect("quote");
-        if quote.amount == 0 {
-            // Nothing fillable in this direction right now (window exhausted
-            // by the previous sample): nothing to execute or compare.
-            return Parity {
-                amount_requested: amount,
-                amount_executed: 0,
-                partial: true,
-                expected: 0,
-                received: 0,
-                error: None,
-                pool_matches: true,
-                surge_fee: 0,
-                compute_units: 0,
-                block_time: 0,
-                clock_adjusted: None,
-            };
-        }
-        let (dec_in, dec_out) = (
-            venue.get_token(i as usize).unwrap().decimals as u8,
-            venue.get_token(j as usize).unwrap().decimals as u8,
-        );
-        let predict = |now: i64| -> (u64, u64, CofferPool) {
-            let outcome = quote_exact_in(venue.pool(), quote.amount, i, j, dec_in, dec_out, now)
-                .expect("exact quote at the fillable amount");
-            let mut predicted = *venue.pool();
-            apply_swap(&mut predicted, i, j, &outcome).unwrap();
-            (outcome.amount_out_user, outcome.surge_fee_amount, predicted)
-        };
-        let (expected, surge_fee, predicted) = predict(venue.now);
-
-        let out_tp = venue.get_token(j as usize).unwrap().get_token_program();
-        let before = self.token_balance(&request.output_mint, &out_tp).await;
-        let executed = QuoteRequest {
-            amount: quote.amount,
-            ..request.clone()
-        };
-        let ixs = if routed {
-            // A routed coffer leg needs more than the router's 200k default:
-            // the router spends ~45k CU creating the TitanPDA ATAs and the
-            // 4-segment surge fee costs the swap four extra curve evaluations.
-            vec![
-                ComputeBudgetInstruction::set_compute_unit_limit(600_000),
-                build_route_ix(venue, &executed, self.wallet.pubkey()).unwrap(),
-            ]
-        } else {
-            vec![
-                venue
-                    .generate_swap_instruction(executed, self.wallet.pubkey())
-                    .unwrap(),
-            ]
-        };
-        let sent = self.send(&ixs).await;
-        let after = self.token_balance(&request.output_mint, &out_tp).await;
-        let chain = self.pool_state(venue.market_id()).await;
-        let received = after - before;
-        let (mut block_time, mut compute_units) = (0, 0);
-        let mut clock_adjusted = None;
-        if let Ok(sig) = &sent {
-            let (bt, cu) = self.tx_meta(sig).await;
-            block_time = bt;
-            compute_units = cu;
-            if (received != expected || chain != predicted) && bt != venue.now {
-                let (e2, _, p2) = predict(bt);
-                clock_adjusted = Some(ClockAdjusted {
-                    block_time_minus_now: bt - venue.now,
-                    expected: e2,
-                    matches: received == e2 && chain == p2,
-                });
-            }
-        }
-        Parity {
-            amount_requested: amount,
-            amount_executed: quote.amount,
-            partial: quote.not_enough_liquidity,
-            expected,
-            received,
-            error: sent.err(),
-            pool_matches: chain == predicted,
-            surge_fee,
-            compute_units,
-            block_time,
-            clock_adjusted,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ClockAdjusted {
-    block_time_minus_now: i64,
-    expected: u64,
-    matches: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Parity {
-    amount_requested: u64,
-    amount_executed: u64,
-    partial: bool,
-    expected: u64,
-    received: u64,
-    error: Option<u32>,
-    pool_matches: bool,
-    surge_fee: u64,
-    compute_units: u64,
-    block_time: i64,
-    /// Set when the plain comparison failed and the venue's clock differed
-    /// from the block time: the re-quote at the block time.
-    clock_adjusted: Option<ClockAdjusted>,
-}
-
-impl Parity {
-    /// Exact at the venue's clock.
-    fn exact(&self) -> bool {
-        self.error.is_none() && self.received == self.expected && self.pool_matches
-    }
-    /// Exact at the venue's clock, or exact once the venue clock is set to the
-    /// block time (the window moved between quote and landing).
-    fn ok(&self) -> bool {
-        self.exact() || self.clock_adjusted.is_some_and(|c| c.matches)
-    }
-}
-
-fn geometric(lb: u64, ub: u64, n: usize) -> Vec<u64> {
-    let mut v: Vec<u64> = (0..n)
-        .map(|k| {
-            let t = k as f64 / (n - 1) as f64;
-            (((lb as f64).ln() + t * ((ub as f64).ln() - (lb as f64).ln())).exp() as u64)
-                .clamp(lb, ub)
-        })
-        .collect();
-    v.dedup();
-    v
-}
-
-fn headroom_of(venue: &CofferVenue, i: u8, j: u8) -> QuoteResult {
-    venue
-        .quote(QuoteRequest {
-            input_mint: venue.get_token(i as usize).unwrap().pubkey,
-            output_mint: venue.get_token(j as usize).unwrap().pubkey,
-            amount: u64::MAX / 8,
-            swap_type: SwapType::ExactIn,
-        })
-        .expect("probe quote")
-}
+mod stand;
+use stand::*;
 
 // ---------------------------------------------------------------------------
 // 1. Titan's shared suite on every static pool
 // ---------------------------------------------------------------------------
-
-const SUITE_TESTS: [&str; 8] = [
-    "construction",
-    "zero_input_spot_price",
-    "bound_simulation",
-    "random_samples",
-    "monotone",
-    "quoting_speed",
-    "price_monotone",
-    "mean_value_theorem",
-];
-
-/// Run one shared-suite function on its own OS thread with a private runtime
-/// (the suite's futures hold a LiteSVM and are not `Send`), capturing a panic
-/// as the failure message.
-async fn run_suite_test(name: &str, pool: Pubkey) -> Result<(), String> {
-    let name_owned = name.to_string();
-    let handle = std::thread::spawn(move || {
-        let config = SuiteConfig {
-            pool,
-            programs: vec![COFFER_PROGRAM_ID],
-        };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            match name_owned.as_str() {
-                "construction" => common::construction::<CofferVenue>(&config).await,
-                "zero_input_spot_price" => {
-                    common::zero_input_spot_price::<CofferVenue>(&config).await
-                }
-                "bound_simulation" => common::bound_simulation::<CofferVenue>(&config).await,
-                "random_samples" => common::random_samples::<CofferVenue>(&config).await,
-                "monotone" => common::monotone::<CofferVenue>(&config).await,
-                "quoting_speed" => common::quoting_speed::<CofferVenue>(&config).await,
-                "price_monotone" => common::price_monotone::<CofferVenue>(&config).await,
-                "mean_value_theorem" => common::mean_value_theorem::<CofferVenue>(&config).await,
-                other => panic!("unknown suite test {other}"),
-            }
-        })
-    });
-    tokio::task::spawn_blocking(move || match handle.join() {
-        Ok(()) => Ok(()),
-        Err(payload) => Err(payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_else(|| "panic".into())),
-    })
-    .await
-    .unwrap()
-}
 
 /// The per-direction MVT residual with the input-atom-aware slack, for the
 /// table (see README: the shared MVT tolerance is in output atoms only).
@@ -495,15 +121,57 @@ async fn shared_suite(only: Option<&str>) {
     for pool in stand.manifest.pools.iter().filter(|p| !p.dynamic) {
         let address: Pubkey = pool.address.parse().unwrap();
         let venue = stand.venue(address).await;
+        // The declaration is structural (every ordered pair); a pool with a
+        // deactivated input token declares a direction the suite cannot
+        // quote, so the suite runs on the quotable subset there and the
+        // paused direction is asserted below.
         let dirs = venue.directions_num();
+        let quotable: Vec<(u8, u8)> = dirs
+            .iter()
+            .copied()
+            .filter(|&(i, j)| venue.bounds(i, j).is_ok())
+            .collect();
+        assert_eq!(dirs.len(), pool.tokens.len() * (pool.tokens.len() - 1));
+        for &slot in &pool.inactive_tokens {
+            assert!(
+                dirs.iter().any(|&(i, _)| i == slot),
+                "{}: declared",
+                pool.case
+            );
+            assert!(
+                quotable.iter().all(|&(i, _)| i != slot),
+                "{}: quotable",
+                pool.case
+            );
+        }
+        // A disabled pool / disabled swaps declares its directions too, and
+        // none of them quotes (`InactivePoolError` at every size, including 0).
+        let switched_off = !pool.pool_enabled || !pool.swaps_enabled;
+        if switched_off {
+            assert!(quotable.is_empty(), "{}: nothing quotable", pool.case);
+            for &(i, j) in &dirs {
+                for amount in [0, 1, 1_000_000] {
+                    assert!(
+                        matches!(
+                            venue.quote(stand.request(&venue, i, j, amount)),
+                            Err(TradingVenueError::InactivePoolError(..))
+                        ),
+                        "{}: {i}->{j} at {amount}",
+                        pool.case
+                    );
+                }
+            }
+        }
+        let quotable_only = !pool.inactive_tokens.is_empty() || switched_off;
         let mut results = Vec::new();
         for t in &tests {
-            results.push(run_suite_test(t, address).await);
+            results.push(run_suite_test(t, address, quotable_only).await);
         }
         let (tv, iv, worst, worst_surge) = mvt_residual(&venue);
         let note = format!(
-            "dirs={} mvt: template_violations={tv} (worst {worst:.2e}) beyond_input_atom_slack={iv} (worst {worst_surge:.2e})",
-            dirs.len()
+            "dirs={} quotable={} mvt: template_violations={tv} (worst {worst:.2e}) beyond_input_atom_slack={iv} (worst {worst_surge:.2e})",
+            dirs.len(),
+            quotable.len()
         );
         table.push((pool.case.clone(), results, note));
     }
@@ -614,13 +282,13 @@ async fn real_routed_transactions() {
         let mut nothing_fillable = 0;
         let mut exhausted_directions = 0;
         for (i, j) in venue.directions_num() {
-            // Earlier samples may have filled this input token's window.
+            // Earlier samples may have filled this input token's window, and
+            // a deactivated input token is declared but unquotable.
             venue = stand.venue(address).await;
-            if !venue.directions_num().contains(&(i, j)) {
+            let Ok((lb, ub)) = venue.bounds(i, j) else {
                 exhausted_directions += 1;
                 continue;
-            }
-            let (lb, ub) = venue.bounds(i, j).unwrap();
+            };
             let (in_mint, in_tp) = (
                 venue.get_token(i as usize).unwrap().pubkey,
                 venue.get_token(i as usize).unwrap().get_token_program(),
@@ -650,13 +318,15 @@ async fn real_routed_transactions() {
                 }
             }
         }
-        // Deactivated input token: the direction is absent, the program reverts.
+        // Deactivated input token: the direction stays declared but has no
+        // quotable range, the quote refuses and the program reverts.
         for &slot in &pool.inactive_tokens {
             assert!(
-                venue.directions_num().iter().all(|(i, _)| *i != slot),
-                "{}: inactive slot listed",
+                venue.directions_num().iter().any(|(i, _)| *i == slot),
+                "{}: inactive slot must stay declared",
                 pool.case
             );
+            assert!(venue.bounds(slot, if slot == 0 { 1 } else { 0 }).is_err());
             let other = if slot == 0 { 1 } else { 0 };
             let q = venue.quote(stand.request(&venue, slot, other, 1_000_000));
             assert!(
@@ -750,12 +420,8 @@ async fn fill_window(
         .unwrap()
         .unwrap_or(0);
     assert!(
-        !venue.directions_num().contains(&(0, 1)),
-        "{case}: full window still listed"
-    );
-    assert!(
-        venue.directions_num().contains(&(1, 0)),
-        "{case}: buy side must stay listed"
+        venue.directions_num().contains(&(0, 1)) && venue.directions_num().contains(&(1, 0)),
+        "{case}: both directions stay declared (the window rotates on its own)"
     );
     assert!(
         venue.bounds(0, 1).is_err(),
@@ -951,8 +617,8 @@ async fn dynamic_real_time_rotation() {
     }
     venue = stand.venue(pool).await;
     assert!(
-        venue.directions_num().contains(&(0, 1)),
-        "direction must come back after one period"
+        venue.bounds(0, 1).is_ok(),
+        "the quotable range must come back after one period"
     );
     let head = headroom_of(&venue, 0, 1).amount;
     assert!(
@@ -1010,11 +676,20 @@ async fn dynamic_toggles() {
         .await
         .unwrap();
     let venue = stand.venue(pool).await;
-    assert_eq!(venue.directions_num(), vec![(1, 0)]);
+    assert_eq!(
+        venue.directions_num(),
+        vec![(0, 1), (1, 0)],
+        "declaration is structural"
+    );
+    assert!(
+        venue.bounds(0, 1).is_err(),
+        "no quotable range while deactivated"
+    );
     assert!(matches!(
         venue.quote(stand.request(&venue, 0, 1, 1_000_000)),
         Err(TradingVenueError::AmmMethodError(_))
     ));
+    assert!(venue.quote(stand.request(&venue, 0, 1, 0)).is_err());
     let ix = venue
         .generate_swap_instruction(stand.request(&venue, 0, 1, 1_000_000), me)
         .unwrap();
@@ -1028,7 +703,7 @@ async fn dynamic_toggles() {
         .await;
     assert!(p.ok(), "buying the deactivated token via the router: {p:?}");
     println!(
-        "  BONK deactivated: direction absent, quote refuses (TokenInactive), program reverts 6054, buying BONK via router exact"
+        "  BONK deactivated: direction still declared, no quotable range, quote refuses (TokenInactive), program reverts 6054, buying BONK via router exact"
     );
     // reactivate
     stand
@@ -1037,7 +712,7 @@ async fn dynamic_toggles() {
         .unwrap();
     let venue = stand.venue(pool).await;
     assert!(venue.directions_num().contains(&(0, 1)));
-    let (lb, ub) = venue.bounds(0, 1).unwrap();
+    let (lb, ub) = venue.bounds(0, 1).expect("quotable again once reactivated");
     let p = stand
         .parity_swap(&venue, 0, 1, geometric(lb, ub, 3)[1], true)
         .await;

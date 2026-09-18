@@ -594,13 +594,57 @@ fn max_selloff_boundary_is_exact() {
         10_000_000_000_000
     );
 
-    // Window now full: headroom 0 → any sell is a zero partial fill.
+    // Window now full: headroom 0 → any sell is a zero partial fill, and the
+    // direction stays declared (the window rotates on its own).
     let q = fx.quote(0, 1, 1).unwrap();
     assert!(q.not_enough_liquidity && q.amount == 0 && q.expected_output == 0);
+    assert!(fx.venue.directions_num().contains(&(0, 1)));
+    assert!(fx.venue.bounds(0, 1).is_err());
     assert_eq!(fx.swap(0, 1, 1), Err(ErrorCode::MaxSelloffExceeded.code()));
     // The other direction is uncapped and unaffected.
     fx.refresh();
     fx.check_swap(1, 0, 1_000_000);
+}
+
+/// A partial fill reports the same fillable amount whether the request is
+/// just above the headroom or far above it, and that amount never includes
+/// the input atoms a 100%-at-full-fill surge curve would take entirely: the
+/// `MaxSelloffExceeded` path applies the same exhaustion pull-back as the
+/// in-cap path, and the reported amount executes exactly on-chain.
+#[test]
+fn partial_fill_above_headroom_stops_at_the_surge_exhaustion_point() {
+    let mut fx = Fixture::new(
+        3_000,
+        &[
+            TokenSpec::new(9, 5_000, 10_000_000_000_000, 10_000_000_000_000)
+                .cap(1_000)
+                .surge(0, 0, 5_000, 10_000, 50),
+            TokenSpec::new(6, 5_000, 10_000_000_000, 10_000_000_000),
+        ],
+    );
+    let cap = 10_000_000_000_000 / 10;
+    // Two request sizes in the `MaxSelloffExceeded` branch and one in the
+    // in-cap branch that saturates at 100%: all three agree.
+    let far = fx.quote(0, 1, u64::MAX / 8).unwrap();
+    let near = fx.quote(0, 1, cap + 1).unwrap();
+    let at_cap = fx.quote(0, 1, cap).unwrap();
+    assert!(far.not_enough_liquidity && near.not_enough_liquidity && at_cap.not_enough_liquidity);
+    assert_eq!(far.amount, near.amount);
+    assert_eq!(far.amount, at_cap.amount);
+    assert!(far.amount > 0 && far.amount < cap, "{far:?}");
+    assert_eq!(far.expected_output, at_cap.expected_output);
+    assert!(
+        far.price > 0.0,
+        "the reported edge is not yet at a 100% rate"
+    );
+    // Requesting the reported amount directly is a full fill of that size.
+    let direct = fx.quote(0, 1, far.amount).unwrap();
+    assert!(!direct.not_enough_liquidity);
+    assert_eq!(direct.expected_output, far.expected_output);
+    // One atom more already buys nothing.
+    let more = fx.quote(0, 1, far.amount + 1).unwrap();
+    assert!(more.not_enough_liquidity && more.amount == far.amount);
+    fx.check_swap(0, 1, far.amount);
 }
 
 /// Split versus whole: two sequential sells (re-reading the pool and calling
@@ -902,12 +946,23 @@ fn kill_switches() {
             TokenSpec::new(6, 2_000, 500_000_000_000, 0), // live vb, no LP balance
         ],
     );
-    // Directions: 0 is inactive as INPUT; 2 has no actual balance as OUTPUT.
-    assert_eq!(fx.venue.directions_num(), vec![(1, 0), (2, 0), (2, 1)]);
+    // The declared directions are structural: every ordered pair, whether or
+    // not it can trade right now (0 is inactive as INPUT, 2 has no actual
+    // balance as OUTPUT — both are admin/LP-reversible states, answered by
+    // `quote`, not by the declaration).
+    assert_eq!(
+        fx.venue.directions_num(),
+        vec![(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
+    );
     assert!(matches!(
         fx.quote(0, 1, 1_000).unwrap_err(),
         TradingVenueError::AmmMethodError(_)
     ));
+    assert!(
+        fx.quote(0, 1, 0).is_err(),
+        "no spot price for a paused input"
+    );
+    assert!(fx.venue.bounds(0, 1).is_err(), "no quotable range");
     assert_eq!(fx.swap(0, 1, 1_000), Err(ErrorCode::TokenInactive.code()));
     fx.refresh();
     // Buying the inactive token is fine.

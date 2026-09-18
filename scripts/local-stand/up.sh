@@ -23,7 +23,9 @@ WALLET=$(solana address)
 python3 scripts/local-stand/patch-config.py "$WALLET"
 
 if [ "${1:-}" != "--no-reset" ]; then
-  pkill -f solana-test-validator || true
+  # Only the stand's own validator (matched by its ledger path): other
+  # solana-test-validator instances on this machine are left alone.
+  pkill -f "solana-test-validator.*--ledger $LEDGER" || true
   sleep 1
   rm -rf "$LEDGER"
   nohup solana-test-validator --reset --quiet --ledger "$LEDGER" \

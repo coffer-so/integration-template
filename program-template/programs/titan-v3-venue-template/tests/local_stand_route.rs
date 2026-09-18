@@ -7,10 +7,10 @@ mod common;
 
 use std::path::Path;
 
-use common::{run_swap_route, RouteConfig};
+use common::{RouteConfig, run_swap_route};
 use solana_pubkey::Pubkey;
-use titan_integration_template::coffer_venue::{CofferVenue, COFFER_PROGRAM_ID};
-use titan_integration_template::local_stand::StandManifest;
+use titan_integration_template::coffer_venue::{COFFER_PROGRAM_ID, CofferVenue};
+use titan_integration_template::local_stand::{QuotableDirections, StandManifest};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_simulation_over_the_local_stand() {
@@ -41,10 +41,17 @@ async fn route_simulation_over_the_local_stand() {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(run_swap_route::<CofferVenue>(RouteConfig {
-                pool: address,
-                venue_programs: vec![COFFER_PROGRAM_ID],
-            }))
+            // The venue declares every ordered pair (structural); the route
+            // harness unwraps `bounds` per direction, so it sees the venue
+            // through `QuotableDirections`: a deactivated input token or a
+            // switched-off pool declares directions that have no quotable
+            // range and are asserted by the matrix tests instead.
+            rt.block_on(run_swap_route::<QuotableDirections<CofferVenue>>(
+                RouteConfig {
+                    pool: address,
+                    venue_programs: vec![COFFER_PROGRAM_ID],
+                },
+            ))
         });
         let status = match tokio::task::spawn_blocking(move || handle.join())
             .await

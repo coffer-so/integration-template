@@ -4,28 +4,110 @@
 //! `program-template`.
 //!
 //! Instruction shapes mirror the contract's `#[derive(Accounts)]` contexts on
-//! branch `main` (`initialize_pool`, `add_liquidity`, `set_max_selloff`,
-//! `set_token_active`, `set_swaps_enabled`, `set_pool_enabled`). The stand
-//! manifest (`scripts/local-stand/stand.json`) written by the `local-stand`
-//! binary is what `tests/local_stand_matrix.rs` iterates.
+//! branch `main` (`initialize_pool`, `add_liquidity`, `remove_liquidity`,
+//! `set_max_selloff`, `set_token_active`, `set_swaps_enabled`,
+//! `set_pool_enabled`, `set_range_manager`, `set_range_manager_config`,
+//! `range_manager_update`). The stand manifest
+//! (`scripts/local-stand/stand.json`) written by the `local-stand` binary is
+//! what `tests/local_stand_matrix.rs` and `tests/local_stand_range_manager.rs`
+//! iterate.
 
 use std::path::{Path, PathBuf};
 
+use async_trait::async_trait;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
+use solana_account::Account;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 
+use crate::account_caching::AccountsCache;
 use crate::coffer::state::CofferPool;
 use crate::coffer_venue::COFFER_PROGRAM_ID;
 use crate::coffer_venue::instruction::{
-    ADD_LIQUIDITY_DISCRIMINATOR, INITIALIZE_POOL_DISCRIMINATOR, ROUTER_INITIALIZE_DISCRIMINATOR,
-    SET_MAX_SELLOFF_DISCRIMINATOR, SET_POOL_ENABLED_DISCRIMINATOR, SET_SWAPS_ENABLED_DISCRIMINATOR,
+    ADD_LIQUIDITY_DISCRIMINATOR, INITIALIZE_POOL_DISCRIMINATOR, RANGE_MANAGER_UPDATE_DISCRIMINATOR,
+    REMOVE_LIQUIDITY_DISCRIMINATOR, ROUTER_INITIALIZE_DISCRIMINATOR, SET_MAX_SELLOFF_DISCRIMINATOR,
+    SET_POOL_ENABLED_DISCRIMINATOR, SET_RANGE_MANAGER_CONFIG_DISCRIMINATOR,
+    SET_RANGE_MANAGER_DISCRIMINATOR, SET_SWAPS_ENABLED_DISCRIMINATOR,
     SET_TOKEN_ACTIVE_DISCRIMINATOR,
 };
 use crate::swap_route::{ROUTE_WEIGHT_ALL, build_swap_leg, encode_swap_route_v3_data};
-use crate::trading_venue::{QuoteRequest, TradingVenue, error::TradingVenueError};
+use crate::trading_venue::{
+    FromAccount, QuoteRequest, QuoteResult, TradingVenue, error::TradingVenueError,
+    protocol::PoolProtocol, token_info::TokenInfo,
+};
+
+/// Test-harness adapter: a venue whose `directions_num` is restricted to the
+/// directions that currently have a quotable range (`bounds` succeeds).
+///
+/// `CofferVenue::directions_num` is structural — it declares every ordered
+/// pair of the pool's slots, whether or not the pair can trade right now — so
+/// that a router which caches the declaration never loses a direction that
+/// was merely paused (deactivated input token, exhausted sell-off window,
+/// sidelined output token) when it was declared. Titan's shared suite,
+/// however, asserts that every declared direction quotes, which a pool with a
+/// deactivated token cannot satisfy. Wrapping the venue in this adapter runs
+/// the suite on the live directions only; the paused direction is asserted
+/// separately by the stand tests.
+pub struct QuotableDirections<V>(pub V);
+
+impl<V: FromAccount> FromAccount for QuotableDirections<V> {
+    fn from_account(pubkey: &Pubkey, account: &Account) -> Result<Self, TradingVenueError> {
+        V::from_account(pubkey, account).map(Self)
+    }
+}
+
+#[async_trait]
+impl<V: TradingVenue + Send + Sync> TradingVenue for QuotableDirections<V> {
+    fn initialized(&self) -> bool {
+        self.0.initialized()
+    }
+    fn program_id(&self) -> Pubkey {
+        self.0.program_id()
+    }
+    fn program_dependencies(&self) -> Vec<Pubkey> {
+        self.0.program_dependencies()
+    }
+    fn market_id(&self) -> Pubkey {
+        self.0.market_id()
+    }
+    fn tradable_mints(&self) -> Result<Vec<Pubkey>, TradingVenueError> {
+        self.0.tradable_mints()
+    }
+    fn directions_num(&self) -> Vec<(u8, u8)> {
+        self.0
+            .directions_num()
+            .into_iter()
+            .filter(|&(i, j)| self.0.bounds(i, j).is_ok())
+            .collect()
+    }
+    fn decimals(&self) -> Result<Vec<i32>, TradingVenueError> {
+        self.0.decimals()
+    }
+    fn get_token_info(&self) -> &[TokenInfo] {
+        self.0.get_token_info()
+    }
+    fn protocol(&self) -> PoolProtocol {
+        self.0.protocol()
+    }
+    fn get_required_pubkeys_for_update(&self) -> Result<Vec<Pubkey>, TradingVenueError> {
+        self.0.get_required_pubkeys_for_update()
+    }
+    async fn update_state(&mut self, cache: &dyn AccountsCache) -> Result<(), TradingVenueError> {
+        self.0.update_state(cache).await
+    }
+    fn quote(&self, request: QuoteRequest) -> Result<QuoteResult, TradingVenueError> {
+        self.0.quote(request)
+    }
+    fn generate_swap_instruction(
+        &self,
+        request: QuoteRequest,
+        user: Pubkey,
+    ) -> Result<Instruction, TradingVenueError> {
+        self.0.generate_swap_instruction(request, user)
+    }
+}
 
 /// The Titan router program id declared by `program-template`.
 pub const ROUTER_PROGRAM_ID: Pubkey =
@@ -191,6 +273,136 @@ pub fn add_liquidity_ix(
     Instruction {
         program_id: COFFER_PROGRAM_ID,
         accounts,
+        data,
+    }
+}
+
+/// `remove_liquidity(bpt_amount, minimum_token_amounts = 0…)` with the
+/// `remaining_accounts` layout `[vault_i, user_i]*n, mint_i*n,
+/// token_program_i*n` (vaults FIRST — flipped relative to `add_liquidity`).
+pub fn remove_liquidity_ix(
+    pool: Pubkey,
+    user: Pubkey,
+    mints: &[(Pubkey, Pubkey)],
+    bpt_amount: u64,
+) -> Instruction {
+    let bpt = bpt_mint(&pool);
+    let mut data = REMOVE_LIQUIDITY_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&bpt_amount.to_le_bytes());
+    BorshSerialize::serialize(&vec![0u64; mints.len()], &mut data).unwrap();
+    let mut accounts = vec![
+        AccountMeta::new(pool, false),
+        AccountMeta::new(bpt, false),
+        AccountMeta::new(ata(&user, &bpt, &spl_token::ID), false),
+        AccountMeta::new_readonly(user, true),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    for (mint, tp) in mints {
+        accounts.push(AccountMeta::new(
+            CofferPool::derive_vault(&pool, mint, tp),
+            false,
+        ));
+        accounts.push(AccountMeta::new(ata(&user, mint, tp), false));
+    }
+    for (mint, _) in mints {
+        accounts.push(AccountMeta::new_readonly(*mint, false));
+    }
+    for (_, tp) in mints {
+        accounts.push(AccountMeta::new_readonly(*tp, false));
+    }
+    Instruction {
+        program_id: COFFER_PROGRAM_ID,
+        accounts,
+        data,
+    }
+}
+
+/// One `range_manager_update` change entry: "slot `index` currently holds
+/// `expected_current` (compare-and-swap guard); set it to `new_value`".
+#[derive(BorshSerialize, BorshDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenChange {
+    pub index: u8,
+    pub expected_current: u64,
+    pub new_value: u64,
+}
+
+impl TokenChange {
+    pub const fn new(index: u8, expected_current: u64, new_value: u64) -> Self {
+        Self {
+            index,
+            expected_current,
+            new_value,
+        }
+    }
+}
+
+/// `set_range_manager(new_manager, enabled)` — pool admin (the protocol
+/// admin may only disable). Accounts: config, pool(w), authority(signer).
+pub fn set_range_manager_ix(
+    config: Pubkey,
+    pool: Pubkey,
+    authority: Pubkey,
+    new_manager: Pubkey,
+    enabled: bool,
+) -> Instruction {
+    let mut args = new_manager.to_bytes().to_vec();
+    args.push(enabled as u8);
+    config_pool_authority(
+        SET_RANGE_MANAGER_DISCRIMINATOR,
+        config,
+        pool,
+        authority,
+        &args,
+    )
+}
+
+/// `set_range_manager_config(max_vb_change_pct, max_weight_change_pct,
+/// min_update_interval_secs, max_leverage_bps, min_leverage_bps)` — pool
+/// admin only. Accounts: pool(w), authority(signer).
+pub fn set_range_manager_config_ix(
+    pool: Pubkey,
+    authority: Pubkey,
+    max_vb_change_pct: u16,
+    max_weight_change_pct: u16,
+    min_update_interval_secs: u32,
+    max_leverage_bps: u32,
+    min_leverage_bps: u32,
+) -> Instruction {
+    let mut data = SET_RANGE_MANAGER_CONFIG_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&max_vb_change_pct.to_le_bytes());
+    data.extend_from_slice(&max_weight_change_pct.to_le_bytes());
+    data.extend_from_slice(&min_update_interval_secs.to_le_bytes());
+    data.extend_from_slice(&max_leverage_bps.to_le_bytes());
+    data.extend_from_slice(&min_leverage_bps.to_le_bytes());
+    Instruction {
+        program_id: COFFER_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(authority, true),
+        ],
+        data,
+    }
+}
+
+/// `range_manager_update(vb_changes, weight_changes)` — the appointed range
+/// manager only. Accounts: pool(w), authority(signer). Rewrites the listed
+/// slots' `virtual_balance` / `normalized_weight` in one instruction; the
+/// sell-off window (`selloff_vb_snapshot`, accumulators) is NOT rescaled.
+pub fn range_manager_update_ix(
+    pool: Pubkey,
+    authority: Pubkey,
+    vb_changes: &[TokenChange],
+    weight_changes: &[TokenChange],
+) -> Instruction {
+    let mut data = RANGE_MANAGER_UPDATE_DISCRIMINATOR.to_vec();
+    BorshSerialize::serialize(&vb_changes.to_vec(), &mut data).unwrap();
+    BorshSerialize::serialize(&weight_changes.to_vec(), &mut data).unwrap();
+    Instruction {
+        program_id: COFFER_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(authority, true),
+        ],
         data,
     }
 }
@@ -424,6 +636,56 @@ impl StandManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_manager_instruction_layouts() {
+        let (pool, me) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let ix = range_manager_update_ix(
+            pool,
+            me,
+            &[TokenChange::new(0, 10, 11)],
+            &[
+                TokenChange::new(1, 5_000, 5_500),
+                TokenChange::new(0, 5_000, 4_500),
+            ],
+        );
+        let d = &ix.data;
+        assert_eq!(&d[..8], &RANGE_MANAGER_UPDATE_DISCRIMINATOR);
+        // vec len (u32) + 1 × (u8 + u64 + u64), then vec len + 2 × 17
+        assert_eq!(d.len(), 8 + 4 + 17 + 4 + 2 * 17);
+        assert_eq!(u32::from_le_bytes(d[8..12].try_into().unwrap()), 1);
+        assert_eq!(d[12], 0);
+        assert_eq!(u64::from_le_bytes(d[13..21].try_into().unwrap()), 10);
+        assert_eq!(u64::from_le_bytes(d[21..29].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(d[29..33].try_into().unwrap()), 2);
+        assert_eq!(d[33], 1);
+        assert_eq!(ix.accounts.len(), 2);
+        assert!(ix.accounts[0].is_writable && ix.accounts[1].is_signer);
+
+        let cfg = set_range_manager_config_ix(pool, me, 500, 200, 60, 30_000, 5_000);
+        assert_eq!(cfg.data.len(), 8 + 2 + 2 + 4 + 4 + 4);
+        assert_eq!(&cfg.data[8..10], &500u16.to_le_bytes());
+        assert_eq!(&cfg.data[10..12], &200u16.to_le_bytes());
+        assert_eq!(&cfg.data[12..16], &60u32.to_le_bytes());
+        assert_eq!(&cfg.data[16..20], &30_000u32.to_le_bytes());
+        assert_eq!(&cfg.data[20..24], &5_000u32.to_le_bytes());
+
+        let set = set_range_manager_ix(LOCAL_CONFIG, pool, me, me, true);
+        assert_eq!(set.data.len(), 8 + 32 + 1);
+        assert_eq!(&set.data[8..40], me.as_ref());
+        assert_eq!(set.data[40], 1);
+        assert_eq!(set.accounts.len(), 3);
+
+        let mints = [(Pubkey::new_unique(), spl_token::ID); 2];
+        let rm = remove_liquidity_ix(pool, me, &mints, 7);
+        assert_eq!(rm.data.len(), 8 + 8 + 4 + 16);
+        assert_eq!(rm.accounts.len(), 5 + 2 * 4);
+        assert_eq!(
+            rm.accounts[5].pubkey,
+            CofferPool::derive_vault(&pool, &mints[0].0, &spl_token::ID)
+        );
+        assert_eq!(rm.accounts[6].pubkey, ata(&me, &mints[0].0, &spl_token::ID));
+    }
 
     #[test]
     fn selloff_params_borsh_layout() {

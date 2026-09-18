@@ -20,6 +20,16 @@
 //!   search over the exact quote;
 //! - `ZeroFeeAmount` (unreachable on `main`: the fee rounds UP) and config /
 //!   arithmetic failures are errors.
+//!
+//! State freshness: nothing a quote reads survives `update_state`. The pool
+//! account (virtual/actual balances, weights, fee rates, kill switches, the
+//! sell-off caps and surge curves, the window accumulators and snapshot), the
+//! mints and the Clock sysvar are re-read on every refresh and the per-direction
+//! curve parameters are rebuilt from them; the only thing fixed at creation is
+//! the token set, which the contract cannot change either. The pool's admin
+//! and range-manager roles may move virtual balances, weights, caps and curves
+//! at any time between two refreshes — see `directions_num` for why the
+//! declared directions do not depend on any of that.
 
 pub mod instruction;
 pub mod price;
@@ -228,12 +238,8 @@ impl CofferVenue {
         ) {
             Ok(Some(r)) => Ok(Some((r.effective_selloff, r.max_selloff_cap))),
             Ok(None) => Ok(None),
-            Err(ErrorCode::MaxSelloffExceeded) => {
-                // Beyond the cap: the rate saturates at full fill.
-                let probe = selloff_headroom(&self.pool, in_idx, self.now).map_err(map_error)?;
-                let _ = probe;
-                Ok(Some((u64::MAX, 1)))
-            }
+            // Beyond the cap: the rate saturates at full fill.
+            Err(ErrorCode::MaxSelloffExceeded) => Ok(Some((u64::MAX, 1))),
             Err(e) => Err(map_error(e)),
         }
     }
@@ -244,7 +250,8 @@ impl CofferVenue {
         let cfg = &self.pool.tokens[in_idx as usize].config;
         let saturated = |x: u64| match self.selloff_after(in_idx, x) {
             Ok(Some((effective, cap))) => surge_rate(cfg, effective, cap) >= 1.0,
-            _ => true,
+            Ok(None) => false, // uncapped token: no surge at all
+            Err(_) => true,
         };
         if hi == 0 || !saturated(hi) {
             return hi;
@@ -292,6 +299,11 @@ impl CofferVenue {
         lo
     }
 
+    /// A partial fill of at most `hi` gross input atoms: the largest input the
+    /// program accepts (window cap, LP balance), then pulled back to the point
+    /// where the surge rate reaches 100% so the reported amount never contains
+    /// input atoms that buy nothing — the same answer `quote` gives when asked
+    /// for that size directly.
     fn partial_fill(
         &self,
         request: &QuoteRequest,
@@ -299,7 +311,8 @@ impl CofferVenue {
         out_idx: u8,
         hi: u64,
     ) -> Result<QuoteResult, TradingVenueError> {
-        let amount = self.largest_fillable(in_idx, out_idx, hi);
+        let amount =
+            self.surge_exhaustion_point(in_idx, self.largest_fillable(in_idx, out_idx, hi));
         let (expected_output, price) = if amount == 0 {
             (
                 0,
@@ -400,54 +413,38 @@ impl TradingVenue for CofferVenue {
         PoolProtocol::Coffer
     }
 
-    /// Every ordered pair the program would accept and that can produce
-    /// output: the input token must be active (`is_active` is an input-side
-    /// kill switch; inactive tokens can still be bought) and have virtual
-    /// liquidity, the output token must have virtual AND actual (LP-owned)
-    /// balance — a sidelined output token reverts with
-    /// `AmountOutExceedsBalance` at any size.
+    /// Every ordered pair of the pool's token slots — a STRUCTURAL
+    /// declaration, independent of the pool's mutable state.
     ///
-    /// A capped input token whose sell-off window has no headroom at the
-    /// venue's `now` is likewise unavailable: every sell of it reverts with
-    /// `MaxSelloffExceeded` until the window rotates, so the direction is
-    /// left out rather than reported with an empty quotable range. Each pair
-    /// is finally probed once at its largest admissible size (headroom, or the
-    /// LP-balance cap) so a range that rounds to zero output is dropped too.
+    /// The token set is fixed at creation, so this list never changes for a
+    /// given pool. Everything that decides whether a pair can trade RIGHT NOW
+    /// is mutable and is answered by `quote` instead:
+    /// - a deactivated input token (`set_token_active`, an admin kill switch
+    ///   that can be flipped back) makes every sell of it error with
+    ///   `TokenInactive`; buying it keeps working;
+    /// - a capped input token whose sell-off window has no headroom quotes as
+    ///   a partial fill of 0 atoms until the window rotates (minutes);
+    /// - a sidelined output token (`actual_balance == 0`, refilled by the next
+    ///   `add_liquidity`) makes every quote a partial fill of 0 atoms;
+    /// - a disabled pool / disabled swaps error with `InactivePoolError`.
+    ///
+    /// Titan documents this method as the venue's *declared* directions and
+    /// may evaluate it once when the venue is registered rather than after
+    /// every `update_state`. Filtering on transient state here would then
+    /// silently and permanently drop a direction that happened to be paused
+    /// at registration (a full window, a token deactivated for an hour, an
+    /// unseeded slot), while declaring a direction that cannot trade at the
+    /// moment costs the router nothing: `bounds` reports no quotable range and
+    /// `quote` reports zero fillable atoms or the contract's error.
     fn directions_num(&self) -> Vec<(u8, u8)> {
-        let slots = self.pool.active_slots();
-        let mut out = Vec::new();
-        for (i, a) in slots.iter().enumerate() {
-            if !a.config.is_active || a.dynamics.virtual_balance == 0 {
-                continue;
-            }
-            let Ok(in_idx) = u8::try_from(i) else {
-                continue;
-            };
-            let headroom = match selloff_headroom(&self.pool, in_idx, self.now) {
-                Ok(Some(h)) => h,
-                Ok(None) => u64::MAX,
-                Err(_) => continue,
-            };
-            if headroom == 0 {
-                continue;
-            }
-            for (j, b) in slots.iter().enumerate() {
-                if i == j || b.dynamics.virtual_balance == 0 || b.dynamics.actual_balance == 0 {
-                    continue;
-                }
-                let Ok(out_idx) = u8::try_from(j) else {
-                    continue;
-                };
-                // Largest admissible size: the window headroom, else the
-                // largest input the LP balance can pay for.
-                let hi = self.largest_fillable(in_idx, out_idx, headroom);
-                let quotable = hi > 0
-                    && self
-                        .exact(in_idx, out_idx, hi)
-                        .map(|o| o.amount_out_user > 0)
-                        .unwrap_or(false);
-                if quotable {
-                    out.push((in_idx, out_idx));
+        let n = self.pool.active_slots().len();
+        let mut out = Vec::with_capacity(n * n.saturating_sub(1));
+        for i in 0..n {
+            for j in 0..n {
+                if i != j
+                    && let (Ok(a), Ok(b)) = (u8::try_from(i), u8::try_from(j))
+                {
+                    out.push((a, b));
                 }
             }
         }
@@ -656,8 +653,10 @@ impl TradingVenue for CofferVenue {
 impl AddressLookupTableTrait for CofferVenue {
     /// Every static account a swap on this pool touches: the pool, its
     /// vaults, mints and token programs, the program itself, and the pool's
-    /// own on-chain ALT (`pool.lookup_table`, frozen at creation and already
-    /// holding the same set) when initialised.
+    /// own on-chain ALT (`pool.lookup_table`) when one has been provisioned.
+    /// The ALT is created AFTER the pool by `initialize_pool_alt` (once, then
+    /// frozen), so its address is read from the pool state of the latest
+    /// `update_state` on every call rather than captured at construction.
     async fn get_lookup_table_keys(
         &self,
         _accounts_cache: Option<&dyn AccountsCache>,
