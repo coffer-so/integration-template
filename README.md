@@ -327,13 +327,13 @@ low/mid/high, kink)`; see `CASES` in `src/bin/local_stand.rs`):
 | rm_cfg / rm_liq | 50/50 | config b — `set_max_selloff` reconfiguration / liquidity add + remove |
 
 Results of the last clean run (`scripts/local-stand/results/`, reproduced by
-`up.sh && run-matrix.sh`; 26 pools, 4 mints):
+`up.sh && run-matrix.sh`; 32 pools, 4 mints):
 
 | tier | result |
 | --- | --- |
 | 1 shared suite | 19 static pools × 8 tests: everything passes except `mean_value_theorem` on the 17 pools that have a USDC → BONK direction (see below); `construction` also passes under the allocation guard |
 | 2 route simulation | 19/19 pools, every direction, 430 legs exact |
-| 3 real routed txs | 126 `swap_route_v3` transactions on the validator, 126 exact against the quote AND the predicted pool account (one, on the 20 s pool, exact once the venue clock is set to the block time); `l_swaps_off` / `l_pool_off`: quote refuses, program reverts 6021 / 6020; `k_inactive`: BONK direction absent, selling reverts 6054, buying exact; max 284 428 CU per routed tx with the surge active |
+| 3 real routed txs | 126 `swap_route_v3` transactions on the validator, 126 exact against the quote AND the predicted pool account (one, on the 20 s pool, exact once the venue clock is set to the block time); `l_swaps_off` / `l_pool_off`: quote refuses, program reverts 6021 / 6020; `k_inactive`: BONK direction declared but unquotable, selling reverts 6054, buying exact; max 284 428 CU per routed tx with the surge active |
 | 5 range manager / admin | see "Range manager and admin changes": every scenario exact against real transactions; the shared suite passes (except the documented `mean_value_theorem` residual) on each mutated pool |
 | 4 dynamic | windows filled in chunks on b / c / 80-20 c (direct) and b (routed, 10 chunks crossing the kink) with every chunk exact; full window → direction still declared, `bounds` errors, quote reports 0 fillable, program reverts `MaxSelloffExceeded`, buy side exact; surge accrual in the USDC protocol bucket equals the sum of the predicted per-chunk fees (2 194 516 753 atoms on b); 100%-fee config: exhaustion point executed exactly, selling past it pays 0 on-chain; 20 s window: fill, rotate after one period (carry-over headroom sold exactly), fresh cap after two; deactivate / swaps-off / pool-off toggles behave as quoted and revert 6054 / 6021 / 6020 |
 
@@ -418,9 +418,9 @@ validator and asserts exact parity after each move. The review conclusions:
   snapshot — after buys of the token, an LP exit, or a range-manager cut — the
   new cap is smaller, the same input lands at a higher fill, and the execution
   pays LESS than quoted or reverts with `MaxSelloffExceeded`. Measured on the
-  stand (tier 5, `rm_short`, 30 s window): (b) quoted 183 226 263, received
-  295 706 408; (c) after the manager cut BONK's vb by 49%: quoted
-  4 258 847 305, received 4 033 198 947 (5.3% less). In every case the venue
+  stand (tier 5, `rm_short`, 30 s window): (b) quoted 214 427 934, received
+  337 101 206; (c) after the manager cut BONK's vb by 49%: quoted
+  4 287 845 199, received 4 042 376 300 (5.7% less). In every case the venue
   math evaluated at the block time reproduces the execution exactly, i.e. the
   residual is purely the clock. Decision: the venue quotes the contract's
   arithmetic at the refreshed clock and does NOT pre-empt a rotation. A
