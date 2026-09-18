@@ -113,20 +113,33 @@ pub fn parse_pool_creations(instructions: &[ParsedInstruction]) -> Vec<PoolCreat
 #[derive(Debug, Clone, Copy, Default)]
 struct DirectionParams {
     curve: Option<CurveParams>,
+    /// Upper end of the quotable domain when the input token's surge fee is
+    /// live: the input at which the user's NET output peaks. Beyond it the
+    /// contract's segmented surge charge grows faster than the curve output
+    /// (a larger input pays fewer atoms), so requests past it are partial
+    /// fills at the peak — Titan's `f` must be non-decreasing and `price`
+    /// positive on the reported domain. `None` when the direction has no
+    /// surge (net output = curve output, monotone by construction).
+    fill_limit: Option<u64>,
 }
 
 /// Off-chain state of one coffer pool.
+///
+/// The refresh-sensitive fields (`pool`, `now`, the per-direction
+/// parameters derived from them) are private: they are only ever written
+/// together by `update_state`, so a quote can never see a pool from one
+/// refresh with curve parameters from another.
 #[derive(Clone)]
 pub struct CofferVenue {
     /// The pool account address.
     pub pool_key: Pubkey,
     /// Decoded pool account (refreshed by `update_state`).
-    pub pool: CofferPool,
+    pool: CofferPool,
     /// `Clock::unix_timestamp` the pool was last refreshed against; feeds the
     /// sell-off window arithmetic exactly as the program's `Clock::get()`.
-    pub now: i64,
+    now: i64,
     /// Current epoch (for Token-2022 transfer-fee schedules).
-    pub epoch: u64,
+    epoch: u64,
     /// One entry per active slot, in slot order (index == on-chain token index).
     token_info: Vec<TokenInfo>,
     /// Mint decimals per slot.
@@ -139,9 +152,26 @@ pub struct CofferVenue {
 }
 
 impl CofferVenue {
-    /// The decoded pool.
+    /// The decoded pool, as of the last `update_state`.
     pub fn pool(&self) -> &CofferPool {
         &self.pool
+    }
+
+    /// `Clock::unix_timestamp` of the last `update_state` — the clock every
+    /// quote's window arithmetic runs at.
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// Epoch of the last `update_state`.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The quotable domain limit of a direction (see `DirectionParams`):
+    /// `None` when the direction is not surge-limited.
+    pub fn fill_limit(&self, in_idx: u8, out_idx: u8) -> Option<u64> {
+        self.directions[in_idx as usize][out_idx as usize].fill_limit
     }
 
     /// Slot index of `mint` among the active tokens.
@@ -169,6 +199,8 @@ impl CofferVenue {
             .map_err(|e| TradingVenueError::DeserializationFailed(format!("{pubkey}: {e}").into()))
     }
 
+    /// Rebuild every per-direction parameter from the freshly decoded pool,
+    /// clock and decimals (called last in `update_state`).
     fn rebuild_directions(&mut self) {
         let n = self.pool.token_count as usize;
         for i in 0..n.min(MAX_TOKENS) {
@@ -183,9 +215,128 @@ impl CofferVenue {
                         self.pool.swap_fee_rate,
                     )
                 });
-                self.directions[i][j] = DirectionParams { curve };
+                self.directions[i][j] = DirectionParams {
+                    curve,
+                    fill_limit: None,
+                };
             }
         }
+        // The surge-limited directions: the input token has a live cap AND a
+        // surge curve, and the pool can trade. The search runs the exact
+        // quote ~150 times per such direction, once per refresh.
+        if !self.pool.pool_enabled || !self.pool.swaps_enabled {
+            return;
+        }
+        for i in 0..n.min(MAX_TOKENS) {
+            let cfg = &self.pool.tokens[i].config;
+            if cfg.max_selloff_pct == 0 || cfg.variable_fee_slope_high_pct == 0 || !cfg.is_active {
+                continue;
+            }
+            let Ok(in_idx) = u8::try_from(i) else {
+                continue;
+            };
+            let headroom = match selloff_headroom(&self.pool, in_idx, self.now) {
+                Ok(Some(h)) => h,
+                _ => continue,
+            };
+            for j in 0..n.min(MAX_TOKENS) {
+                let Ok(out_idx) = u8::try_from(j) else {
+                    continue;
+                };
+                if i == j || self.directions[i][j].curve.is_none() {
+                    continue;
+                }
+                // Window / LP-balance limit, then where the rate hits 100%
+                // (every further atom buys nothing: price would be 0), then
+                // the net-output peak.
+                let hi = self.largest_fillable(in_idx, out_idx, headroom);
+                let hi = self.surge_exhaustion_point(in_idx, hi);
+                self.directions[i][j].fill_limit = Some(self.net_output_peak(in_idx, out_idx, hi));
+            }
+        }
+    }
+
+    /// Largest input `x <= hi` whose post-swap window position keeps the surge
+    /// rate below 100% (the rate is non-decreasing in the fill).
+    fn surge_exhaustion_point(&self, in_idx: u8, hi: u64) -> u64 {
+        let cfg = &self.pool.tokens[in_idx as usize].config;
+        let saturated = |x: u64| match self.selloff_after(in_idx, x) {
+            Ok(Some((effective, cap))) => surge_rate(cfg, effective, cap) >= 1.0,
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if hi == 0 || !saturated(hi) {
+            return hi;
+        }
+        let (mut lo, mut hi) = (0u64, hi);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if saturated(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo
+    }
+
+    /// The input `x <= hi` at which the user's net output (curve output minus
+    /// the surge fee) is largest.
+    ///
+    /// In the continuous model the net marginal rate `f'(x)·(1 - rate)` is
+    /// never negative, but the contract charges the surge on 4 segments of
+    /// the taxed span at each segment's average rate (quantised to 0.01%),
+    /// re-partitioned for every request size: past some point the charge
+    /// grows faster than the curve pays out, and a larger input receives
+    /// fewer atoms. The net function is unimodal up to a sawtooth of at most
+    /// ~1e-4 of the output (one rate quantum on a segment's output), so a
+    /// ternary search lands on the plateau around the maximum, and the limit
+    /// is the far end of that plateau (see below).
+    fn net_output_peak(&self, in_idx: u8, out_idx: u8, hi: u64) -> u64 {
+        let net = |x: u64| {
+            self.exact(in_idx, out_idx, x)
+                .map(|o| o.amount_out_user)
+                .unwrap_or(0)
+        };
+        let hi_limit = hi;
+        let (mut lo, mut hi) = (0u64, hi);
+        while hi - lo > 2 {
+            let third = (hi - lo) / 3;
+            let (m1, m2) = (lo + third, hi - third);
+            if net(m1) < net(m2) {
+                lo = m1;
+            } else {
+                hi = m2;
+            }
+        }
+        let mut best = (lo, net(lo));
+        for x in lo + 1..=hi {
+            let v = net(x);
+            if v > best.1 {
+                best = (x, v);
+            }
+        }
+        // The sawtooth makes the top a plateau, not a point: extend the limit
+        // to the largest input whose net output is within two rate quanta
+        // (2e-4) of the maximum, so a curve too mild to bend the net output
+        // keeps the whole window as its domain, while a real decline (0.3% at
+        // 95/5 with a 0 → 25% curve) still ends it at the peak.
+        let (peak, max_net) = best;
+        let tolerance = max_net / 5_000;
+        let within = |x: u64| net(x).saturating_add(tolerance) >= max_net;
+        if within(hi_limit) {
+            return hi_limit;
+        }
+        let (mut lo, mut hi) = (peak, hi_limit);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if within(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Marginal user output per input atom at `amount_in` (see `price.rs`).
@@ -244,30 +395,6 @@ impl CofferVenue {
         }
     }
 
-    /// Largest input `x <= hi` whose post-swap window position keeps the surge
-    /// rate below 100% (the rate is non-decreasing in the fill).
-    fn surge_exhaustion_point(&self, in_idx: u8, hi: u64) -> u64 {
-        let cfg = &self.pool.tokens[in_idx as usize].config;
-        let saturated = |x: u64| match self.selloff_after(in_idx, x) {
-            Ok(Some((effective, cap))) => surge_rate(cfg, effective, cap) >= 1.0,
-            Ok(None) => false, // uncapped token: no surge at all
-            Err(_) => true,
-        };
-        if hi == 0 || !saturated(hi) {
-            return hi;
-        }
-        let (mut lo, mut hi) = (0u64, hi);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if saturated(mid) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        lo
-    }
-
     fn exact(&self, in_idx: u8, out_idx: u8, amount_in: u64) -> Result<SwapOutcome, ErrorCode> {
         quote_exact_in(
             &self.pool,
@@ -299,11 +426,20 @@ impl CofferVenue {
         lo
     }
 
-    /// A partial fill of at most `hi` gross input atoms: the largest input the
-    /// program accepts (window cap, LP balance), then pulled back to the point
-    /// where the surge rate reaches 100% so the reported amount never contains
-    /// input atoms that buy nothing — the same answer `quote` gives when asked
-    /// for that size directly.
+    /// The single place a fill is sized: the largest input `<= hi` the program
+    /// accepts (window cap, LP balance, overflow), capped by the direction's
+    /// net-output peak. Every partial-fill path — beyond the window, beyond
+    /// the LP balance, beyond the peak — goes through here, so the reported
+    /// amount is the same whichever limit the request tripped first.
+    fn fillable(&self, in_idx: u8, out_idx: u8, hi: u64) -> u64 {
+        let amount = self.largest_fillable(in_idx, out_idx, hi);
+        match self.directions[in_idx as usize][out_idx as usize].fill_limit {
+            Some(limit) => amount.min(limit),
+            None => amount,
+        }
+    }
+
+    /// A partial fill of at most `hi` gross input atoms (see `fillable`).
     fn partial_fill(
         &self,
         request: &QuoteRequest,
@@ -311,8 +447,7 @@ impl CofferVenue {
         out_idx: u8,
         hi: u64,
     ) -> Result<QuoteResult, TradingVenueError> {
-        let amount =
-            self.surge_exhaustion_point(in_idx, self.largest_fillable(in_idx, out_idx, hi));
+        let amount = self.fillable(in_idx, out_idx, hi);
         let (expected_output, price) = if amount == 0 {
             (
                 0,
@@ -558,22 +693,19 @@ impl TradingVenue for CofferVenue {
             });
         }
 
+        // Past the direction's net-output peak: a partial fill at the peak.
+        if self.directions[in_idx as usize][out_idx as usize]
+            .fill_limit
+            .is_some_and(|limit| request.amount > limit)
+        {
+            return self.partial_fill(&request, in_idx, out_idx, request.amount);
+        }
+
         match self.exact(in_idx, out_idx, request.amount) {
             Ok(o) => {
                 let selloff = o
                     .max_selloff_result
                     .map(|r| (r.effective_selloff, r.max_selloff_cap));
-                if let Some((effective, cap)) = selloff {
-                    let cfg = &self.pool.tokens[in_idx as usize].config;
-                    if surge_rate(cfg, effective, cap) >= 1.0 {
-                        // The surge rate has reached 100% of the output: every
-                        // further input atom is taken in full by the fee, so
-                        // the pool's usable liquidity ends where the rate hits
-                        // 100%. Report that point as the fillable amount.
-                        let hi = self.surge_exhaustion_point(in_idx, request.amount);
-                        return self.partial_fill(&request, in_idx, out_idx, hi);
-                    }
-                }
                 Ok(QuoteResult {
                     input_mint: request.input_mint,
                     output_mint: request.output_mint,

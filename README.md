@@ -334,7 +334,8 @@ Results of the last clean run (`scripts/local-stand/results/`, reproduced by
 | 1 shared suite | 19 static pools × 8 tests: everything passes except `mean_value_theorem` on the 17 pools that have a USDC → BONK direction (see below); `construction` also passes under the allocation guard |
 | 2 route simulation | 19/19 pools, every direction, 430 legs exact |
 | 3 real routed txs | 126 `swap_route_v3` transactions on the validator, 126 exact against the quote AND the predicted pool account (one, on the 20 s pool, exact once the venue clock is set to the block time); `l_swaps_off` / `l_pool_off`: quote refuses, program reverts 6021 / 6020; `k_inactive`: BONK direction absent, selling reverts 6054, buying exact; max 284 428 CU per routed tx with the surge active |
-| 4 dynamic | windows filled in chunks on b / c / 80-20 c (direct) and b (routed, 10 chunks crossing the kink) with every chunk exact; full window → direction absent, `bounds` errors, quote reports 0 fillable, program reverts `MaxSelloffExceeded`, buy side exact; surge accrual in the USDC protocol bucket equals the sum of the predicted per-chunk fees (2 194 516 753 atoms on b); 100%-fee config: exhaustion point executed exactly, selling past it pays 0 on-chain; 20 s window: fill, rotate after one period (carry-over headroom sold exactly), fresh cap after two; deactivate / swaps-off / pool-off toggles behave as quoted and revert 6054 / 6021 / 6020 |
+| 5 range manager / admin | see "Range manager and admin changes": every scenario exact against real transactions; the shared suite passes (except the documented `mean_value_theorem` residual) on each mutated pool |
+| 4 dynamic | windows filled in chunks on b / c / 80-20 c (direct) and b (routed, 10 chunks crossing the kink) with every chunk exact; full window → direction still declared, `bounds` errors, quote reports 0 fillable, program reverts `MaxSelloffExceeded`, buy side exact; surge accrual in the USDC protocol bucket equals the sum of the predicted per-chunk fees (2 194 516 753 atoms on b); 100%-fee config: exhaustion point executed exactly, selling past it pays 0 on-chain; 20 s window: fill, rotate after one period (carry-over headroom sold exactly), fresh cap after two; deactivate / swaps-off / pool-off toggles behave as quoted and revert 6054 / 6021 / 6020 |
 
 ### Range manager and admin changes (state moving under the venue)
 
@@ -379,11 +380,33 @@ validator and asserts exact parity after each move. The review conclusions:
   leaves the window untouched (fill accounting is in input atoms) and changes
   the curve, the spot price (`w_in / w_out` enters the derivative) and the
   surge segment outputs; all are recomputed from the refreshed pool.
-- **Partial fills.** A request beyond the window headroom now reports the
-  same fillable amount as a request AT the headroom: the `MaxSelloffExceeded`
-  path applies the same 100%-surge pull-back as the in-cap path, so the
-  reported amount never contains input atoms that buy nothing and its price
-  is positive (`partial_fill_above_headroom_stops_at_the_surge_exhaustion_point`).
+- **Net output is not monotone under the surge; the quotable domain ends at
+  its peak.** The contract charges the surge on four segments of the taxed
+  span at each segment's average rate (quantised to 0.01%), re-partitioned
+  for every request size. In the continuous model the net marginal rate
+  `f'(x)·(1 - rate)` is never negative, but the segmented charge can grow
+  faster than the curve pays out once the output is front-loaded: at 95/5
+  weights, zero swap fee, cap 50% and a 0 → 25% curve the user receives
+  963 537 089 473 atoms for 4e11 in but 960 973 264 083 for 4.9e11 (a larger
+  input pays 2.6e9 atoms less). Titan requires `f` non-decreasing and
+  `price` positive, so for every surge-limited direction `update_state`
+  locates the input at which the net output peaks (ternary search on the
+  exact port, ~150 quotes per direction per refresh) and the venue ends the
+  quotable domain there: requests past it are partial fills at the peak,
+  `bounds` stops there, and every partial-fill path (window cap, LP balance,
+  peak) sizes the fill through one function so the reported amount does not
+  depend on which limit the request tripped. Measured
+  (`surge_net_output_peak_ends_the_quotable_domain`): the domain ends at
+  77.2% of the cap (95/5, 0 → 25%) and 53.6% (95/5, 0 → 100%), while at
+  50/50 and 5/95 the whole window stays quotable (the net output at the cap
+  is within two rate quanta of its maximum; the domain limit is the far end
+  of that plateau, still short of the point where the rate reaches 100%);
+  the limit executes exactly on-chain. Residual: below the peak the
+  net output carries a sawtooth of one rate quantum on a segment's output
+  (measured worst 6.5e-5 relative at 95/5, invisible at 50/50 on the stand's
+  random-sample `monotone` runs) that no off-chain quote can remove while
+  staying exact; the shared suite's strict `monotone` can trip on it at
+  lopsided weights with steep curves.
 - **Clock staleness** (a quote at clock `t`, the transaction landing at
   `t' > t` with no refresh in between). The pool state being unchanged, only
   the window position differs: (a) inside a window the carry-over decays, the
@@ -399,9 +422,24 @@ validator and asserts exact parity after each move. The review conclusions:
   295 706 408; (c) after the manager cut BONK's vb by 49%: quoted
   4 258 847 305, received 4 033 198 947 (5.3% less). In every case the venue
   math evaluated at the block time reproduces the execution exactly, i.e. the
-  residual is purely the clock: keep the Clock sysvar (already in
-  `get_required_pubkeys_for_update`) refreshed with the pool, and rely on the
-  route-level `minimum_amount_out` for the remaining slot-to-slot drift.
+  residual is purely the clock. Decision: the venue quotes the contract's
+  arithmetic at the refreshed clock and does NOT pre-empt a rotation. A
+  "min over now and the post-rotation state" policy would under-quote every
+  capped direction of every pool for a horizon before each boundary (the
+  post-rotation state is also unknowable exactly: the snapshot it takes is
+  the live vb at landing time, which other swaps move), would break the
+  exact-parity contract the suite checks, and would still not cover a
+  transaction landing later than the horizon. The exposure is bounded by
+  the route-level `minimum_amount_out` and removed by refreshing per slot:
+  keep the Clock sysvar (already in `get_required_pubkeys_for_update`)
+  refreshed with the pool. Note that the template's `RpcClientCache` keeps
+  positive entries forever, so a caller must `reset_cache` or use a fresh
+  cache before each refresh, otherwise `update_state` re-decodes the same
+  pool and clock.
+- **Encapsulation.** `pool`, `now` and the per-direction parameters derived
+  from them are private and only written together by `update_state`
+  (`pool()`, `now()`, `epoch()`, `fill_limit()` are the read accessors), so
+  no caller can desynchronise the cached curve parameters from the pool.
 
 Findings from the matrix:
 

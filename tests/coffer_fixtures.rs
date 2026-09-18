@@ -327,7 +327,7 @@ impl Fixture {
         let cache = SvmCache::snapshot(&self.svm, &keys);
         futures_block_on(venue.update_state(&cache)).unwrap();
         assert!(venue.initialized());
-        assert_eq!(venue.now, self.now());
+        assert_eq!(venue.now(), self.now());
         self.venue = venue;
     }
 
@@ -1195,4 +1195,126 @@ fn zero_input_spot_price_inside_surge_zone() {
         spot_empty.price
     );
     let _ = PERCENT_SCALE;
+}
+
+/// The contract's segmented surge charge can grow faster than the curve pays
+/// out: at 95/5 weights with a 0 → 25% curve the user's NET output peaks
+/// well inside the window and a larger input then receives FEWER atoms
+/// (963 537 089 473 at 4e11 vs 960 973 264 083 at 4.9e11, reproduced here
+/// from the port). Titan needs `f` non-decreasing and `price` positive on
+/// the quotable domain, so the venue ends the domain at the net-output peak:
+/// requests past it are partial fills at the peak, `bounds` stops there, the
+/// peak executes exactly on-chain, and on the domain the output is monotone
+/// up to the contract's own rate quantum (0.01% of a segment's output).
+#[test]
+fn surge_net_output_peak_ends_the_quotable_domain() {
+    // (label, w_in, w_out, slope_high, reference (x, net(x), net(4.9e11)))
+    type Case = (&'static str, u64, u64, u16, Option<(u64, u64, u64)>);
+    let cases: [Case; 4] = [
+        (
+            "95/5 0-25%",
+            9_500,
+            500,
+            2_500,
+            Some((400_000_000_000, 963_537_089_473, 960_973_264_083)),
+        ),
+        ("95/5 0-100%", 9_500, 500, 10_000, None),
+        ("50/50 0-100%", 5_000, 5_000, 10_000, None),
+        ("5/95 0-100%", 500, 9_500, 10_000, None),
+    ];
+    for (label, w0, w1, high, reference) in cases {
+        let mut fx = Fixture::new(
+            0,
+            &[
+                TokenSpec::new(9, w0, 1_000_000_000_000, 1_000_000_000_000)
+                    .cap(5_000)
+                    .surge(0, 0, 0, high, 0),
+                TokenSpec::new(9, w1, 1_000_000_000_000, 1_000_000_000_000),
+            ],
+        );
+        let cap = 500_000_000_000u64;
+        let net = |fx: &Fixture, x: u64| {
+            quote_exact_in(&fx.pool(), x, 0, 1, 9, 9, fx.now())
+                .unwrap()
+                .amount_out_user
+        };
+        if let Some((x, at_x, at_490)) = reference {
+            assert_eq!(net(&fx, x), at_x, "{label}: reviewer's number at 4e11");
+            assert_eq!(
+                net(&fx, 490_000_000_000),
+                at_490,
+                "{label}: reviewer's number at 4.9e11"
+            );
+        }
+        let peak = fx.venue.fill_limit(0, 1).expect("surge-limited direction");
+        assert!(peak > 0 && peak <= cap, "{label}: peak {peak}");
+        // Nothing on a coarse grid beats the peak by more than the rate
+        // quantum's sawtooth, and past it the output falls.
+        let peak_net = net(&fx, peak);
+        let quantum = |v: u64| v as f64 * 2e-4;
+        let mut worst_dip_rel: f64 = 0.0;
+        let mut prev = 0u64;
+        for k in 1..=200u64 {
+            let x = peak * k / 200;
+            let v = net(&fx, x);
+            assert!(
+                v as f64 <= peak_net as f64 + quantum(peak_net),
+                "{label}: net({x}) = {v} > net(peak) = {peak_net}"
+            );
+            if v < prev {
+                worst_dip_rel = worst_dip_rel.max((prev - v) as f64 / prev as f64);
+            }
+            prev = v;
+        }
+        assert!(
+            worst_dip_rel < 2e-4,
+            "{label}: sawtooth below the peak {worst_dip_rel:.2e}"
+        );
+        if peak < cap {
+            assert!(net(&fx, cap) as f64 <= peak_net as f64 + quantum(peak_net));
+        }
+        // Requests beyond the peak: the same partial fill at the peak, with a
+        // positive price; requests at/below it: full fills.
+        let q_cap = fx.quote(0, 1, cap).unwrap();
+        let q_far = fx.quote(0, 1, u64::MAX / 8).unwrap();
+        if peak < cap {
+            assert!(
+                q_cap.not_enough_liquidity && q_cap.amount == peak,
+                "{label}: {q_cap:?}"
+            );
+            assert!(
+                q_far.not_enough_liquidity && q_far.amount == peak,
+                "{label}: {q_far:?}"
+            );
+            assert_eq!(q_cap.expected_output, peak_net);
+            assert!(q_cap.price > 0.0 && q_cap.price.is_finite());
+            let q_past = fx.quote(0, 1, peak + 1).unwrap();
+            assert!(q_past.not_enough_liquidity && q_past.amount == peak);
+        }
+        let q_peak = fx.quote(0, 1, peak).unwrap();
+        assert!(!q_peak.not_enough_liquidity && q_peak.expected_output == peak_net);
+        let (lb, ub) = fx.venue.bounds(0, 1).unwrap();
+        assert!(
+            ub <= peak && peak - ub <= 100,
+            "{label}: ub {ub} vs peak {peak}"
+        );
+        // Price positive and non-increasing (1e-3 slack, as the shared suite)
+        // on a log grid of the domain.
+        let mut prev_price = f64::INFINITY;
+        for x in grid(lb, ub, 40) {
+            let p = fx.quote(0, 1, x).unwrap().price;
+            assert!(
+                p > 0.0 && p <= prev_price * 1.001,
+                "{label}: price at {x}: {p} after {prev_price}"
+            );
+            prev_price = p;
+        }
+        eprintln!(
+            "{label}: cap {cap}, net-output peak at {peak} ({:.1}% of the cap) = {peak_net}, net at cap {}, worst sawtooth below the peak {worst_dip_rel:.2e}, bounds [{lb}, {ub}]",
+            peak as f64 * 100.0 / cap as f64,
+            net(&fx, cap)
+        );
+        // The peak executes exactly on-chain (payout and pool account).
+        fx.check_swap(0, 1, peak);
+    }
 }

@@ -122,7 +122,7 @@ impl Stand {
     /// Block until the validator clock is at least `t`.
     async fn wait_until(&self, pool: Pubkey, t: i64) {
         loop {
-            let now = self.venue(pool).await.now;
+            let now = self.venue(pool).await.now();
             if now >= t {
                 return;
             }
@@ -176,7 +176,7 @@ impl Stand {
                 )
             }
             Err(_) => {
-                let bt = self.venue(venue.market_id()).await.now;
+                let bt = self.venue(venue.market_id()).await.now();
                 let o = quote_exact_in(
                     venue.pool(),
                     amount,
@@ -192,7 +192,7 @@ impl Stand {
         (
             quote.expected_output,
             sent.map(|_| received),
-            block_time - venue.now,
+            block_time - venue.now(),
             exact_at_block_time,
         )
     }
@@ -394,7 +394,7 @@ async fn range_manager_vb_moves_and_rotation() {
         "  +20% vb and 55/45 weights in one update: headroom {head3}, sold {} exact (surge {}), bought BONK with 1000 USDC exact",
         p.amount_executed, p.surge_fee
     );
-    let elapsed_in_window = stand.venue(pool).await.now - window_start;
+    let elapsed_in_window = stand.venue(pool).await.now() - window_start;
     assert!(
         elapsed_in_window < period,
         "the scenario must fit in one window ({elapsed_in_window} s)"
@@ -409,7 +409,7 @@ async fn range_manager_vb_moves_and_rotation() {
     let expected_prev = (pre.tokens[0].dynamics.current_selloff as u128 * live_vb as u128
         / snapshot as u128) as u64;
     let expected_cap = live_vb / 10;
-    let e = (venue.now - (window_start + period)) as u128;
+    let e = (venue.now() - (window_start + period)) as u128;
     let expected_effective = (expected_prev as u128 * (period as u128 - e) / period as u128) as u64;
     assert_eq!(
         head4,
@@ -587,7 +587,7 @@ async fn range_manager_leverage_caps_output() {
             1,
             dec(&venue, 0),
             dec(&venue, 1),
-            venue.now
+            venue.now()
         )
         .unwrap_err(),
         ErrorCode::MaxSelloffExceeded
@@ -605,7 +605,7 @@ async fn range_manager_leverage_caps_output() {
     }
     let venue = stand.venue(pool).await;
     let head = headroom_of(&venue, 0, 1).amount;
-    let window_head = selloff_headroom(venue.pool(), 0, venue.now)
+    let window_head = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     assert!(
@@ -620,7 +620,7 @@ async fn range_manager_leverage_caps_output() {
             1,
             dec(&venue, 0),
             dec(&venue, 1),
-            venue.now
+            venue.now()
         )
         .unwrap_err(),
         ErrorCode::AmountOutExceedsBalance
@@ -636,7 +636,7 @@ async fn range_manager_leverage_caps_output() {
                 1,
                 dec(&venue, 0),
                 dec(&venue, 1),
-                venue.now
+                venue.now()
             )
             .unwrap()
             .surge_fee_amount,
@@ -671,7 +671,7 @@ async fn range_manager_leverage_caps_output() {
     }
     let venue = stand.venue(pool).await;
     let head = headroom_of(&venue, 0, 1).amount;
-    let window_head = selloff_headroom(venue.pool(), 0, venue.now)
+    let window_head = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     assert_eq!(head, window_head, "window cap binds again");
@@ -731,10 +731,10 @@ async fn admin_reconfigures_max_selloff() {
         snapshot
     );
     let head = headroom_of(&venue, 0, 1).amount;
-    let raw = selloff_headroom(venue.pool(), 0, venue.now)
+    let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
-    let fill = effective_before(venue.pool(), venue.now);
+    let fill = effective_before(venue.pool(), venue.now());
     assert_eq!(raw, snapshot * 2 / 10 - fill);
     // Config b reaches a 100% rate at full fill: the last atom buys nothing
     // and the fillable amount stops one short of the raw headroom.
@@ -785,9 +785,9 @@ async fn admin_reconfigures_max_selloff() {
     // The window is at 87.5% of the 10% cap (50% + 37.5% sold above), i.e.
     // already past the new 80% threshold: even a small sell is surcharged,
     // at the rate of the new curve.
-    let fill_pct = effective_before(venue.pool(), venue.now) * 100 / (snapshot / 10);
+    let fill_pct = effective_before(venue.pool(), venue.now()) * 100 / (snapshot / 10);
     assert!(fill_pct >= 80, "fill {fill_pct}%");
-    let small = quote_exact_in(venue.pool(), head / 10, 0, 1, 5, 6, venue.now).unwrap();
+    let small = quote_exact_in(venue.pool(), head / 10, 0, 1, 5, 6, venue.now()).unwrap();
     assert!(
         small.surge_fee_amount > 0,
         "past the threshold: surge on every atom"
@@ -835,12 +835,12 @@ async fn admin_reconfigures_max_selloff() {
     stand.send(&[reconfigure(b)]).await.unwrap();
     let venue = stand.venue(pool).await;
     let head = headroom_of(&venue, 0, 1).amount;
-    let raw = selloff_headroom(venue.pool(), 0, venue.now)
+    let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     assert_eq!(
         raw,
-        snapshot / 10 - effective_before(venue.pool(), venue.now)
+        snapshot / 10 - effective_before(venue.pool(), venue.now())
     );
     assert!(head <= raw && head > 0);
     let p = stand.parity_swap(&venue, 0, 1, head / 2, true).await;
@@ -906,11 +906,11 @@ async fn admin_adds_and_removes_liquidity() {
     );
     let venue = stand.venue(pool).await;
     let head = headroom_of(&venue, 0, 1).amount;
-    let raw = selloff_headroom(venue.pool(), 0, venue.now)
+    let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     let expected_raw = after.tokens[0].dynamics.selloff_vb_snapshot / 10
-        - effective_before(venue.pool(), venue.now);
+        - effective_before(venue.pool(), venue.now());
     assert_eq!(raw, expected_raw);
     let p = stand.parity_swap(&venue, 0, 1, head / 4, false).await;
     assert!(p.ok(), "after add_liquidity: {p:?}");
@@ -959,13 +959,13 @@ async fn admin_adds_and_removes_liquidity() {
     );
     let venue = stand.venue(pool).await;
     let head = headroom_of(&venue, 0, 1).amount;
-    let raw = selloff_headroom(venue.pool(), 0, venue.now)
+    let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     assert_eq!(
         raw,
         after.tokens[0].dynamics.selloff_vb_snapshot / 10
-            - effective_before(venue.pool(), venue.now)
+            - effective_before(venue.pool(), venue.now())
     );
     let p = stand.parity_swap(&venue, 0, 1, head / 3, true).await;
     assert!(p.ok(), "after remove_liquidity: {p:?}");

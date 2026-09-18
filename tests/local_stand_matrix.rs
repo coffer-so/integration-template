@@ -416,7 +416,7 @@ async fn fill_window(
     // Window full (or only dust the venue refuses because it would pay 0).
     venue = stand.venue(pool).await;
     let bucket_after_sells = venue.pool().tokens[1].dynamics.protocol_fees_owed;
-    let raw_head = selloff_headroom(venue.pool(), 0, venue.now)
+    let raw_head = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap_or(0);
     assert!(
@@ -594,7 +594,7 @@ async fn dynamic_real_time_rotation() {
     // window opened (pool creation), so the state is clean.
     let mut venue = stand.venue(pool).await;
     let opened = venue.pool().tokens[0].dynamics.window_start_timestamp;
-    let now = venue.now;
+    let now = venue.now();
     if now < opened + 2 * period + 1 {
         tokio::time::sleep(Duration::from_secs((opened + 2 * period + 1 - now) as u64)).await;
     }
@@ -611,7 +611,7 @@ async fn dynamic_real_time_rotation() {
     let window_start = d.window_start_timestamp;
     // Wait for one rotation.
     let wake = window_start + period + 2;
-    let now = stand.venue(pool).await.now;
+    let now = stand.venue(pool).await.now();
     if wake > now {
         tokio::time::sleep(Duration::from_secs((wake - now) as u64)).await;
     }
@@ -638,7 +638,7 @@ async fn dynamic_real_time_rotation() {
     println!(
         "  after one period: headroom {head} sold exactly (parity ok); +1 atom -> {:?} (clock moved {} s since the quote)",
         r,
-        stand.venue(pool).await.now - venue.now
+        stand.venue(pool).await.now() - venue.now()
     );
     // The post-rotation sell rotated the window once more (it ran at
     // elapsed >= period): count the "two periods" from the NEW window start.
@@ -646,7 +646,7 @@ async fn dynamic_real_time_rotation() {
         .dynamics
         .window_start_timestamp;
     let wake = window_start + 2 * period + 2;
-    let now = stand.venue(pool).await.now;
+    let now = stand.venue(pool).await.now();
     if wake > now {
         tokio::time::sleep(Duration::from_secs((wake - now) as u64)).await;
     }

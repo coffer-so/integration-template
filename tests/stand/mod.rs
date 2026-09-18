@@ -222,7 +222,7 @@ impl Stand {
             apply_swap(&mut predicted, i, j, &outcome).unwrap();
             (outcome.amount_out_user, outcome.surge_fee_amount, predicted)
         };
-        let (expected, surge_fee, predicted) = predict(venue.now);
+        let (expected, surge_fee, predicted) = predict(venue.now());
 
         let out_tp = venue.get_token(j as usize).unwrap().get_token_program();
         let before = self.token_balance(&request.output_mint, &out_tp).await;
@@ -255,10 +255,10 @@ impl Stand {
             let (bt, cu) = self.tx_meta(sig).await;
             block_time = bt;
             compute_units = cu;
-            if (received != expected || chain != predicted) && bt != venue.now {
+            if (received != expected || chain != predicted) && bt != venue.now() {
                 let (e2, _, p2) = predict(bt);
                 clock_adjusted = Some(ClockAdjusted {
-                    block_time_minus_now: bt - venue.now,
+                    block_time_minus_now: bt - venue.now(),
                     expected: e2,
                     matches: received == e2 && chain == p2,
                 });
