@@ -5,7 +5,7 @@ pub mod account_caching;
 #[rustfmt::skip]
 #[allow(clippy::all)]
 pub mod coffer;
+pub mod coffer_venue;
 pub mod example;
 pub mod swap_route;
 pub mod trading_venue;
-pub mod your_venue;
