@@ -137,3 +137,220 @@ our team and go through the next stages of integration.
 4. A quote must average under 1 microsecond (1µs) — see the quoting_speed test
 5. Make sure your instruction accounts match the program’s expectations
 6. Report a marginal `price` in raw output atoms per raw input atom — positive, non-increasing in size, and consistent with `expected_output`
+
+## Coffer venue
+
+This fork implements the template for **Coffer / Cube DEX**
+(mainnet program `8iQtGj9mcUfFUGaiCpPy89swC3s8YTC8FhVZWfgeZhwu`, contract
+branch `main`): a 2..=10-token weighted AMM with virtual liquidity, a
+ceil-rounded swap fee with a protocol cut, a per-token sliding-window sell-off
+cap and a surge fee that rises as that window fills.
+
+### Naming
+
+The product is Coffer; the on-chain program crate still carries its earlier
+internal name. This repository uses Coffer names everywhere. Wire
+compatibility is untouched: every Anchor discriminator is a hard-coded byte
+constant (`src/coffer_venue/instruction.rs`, pinned by a unit test to the
+sha256 digest of its wire name, given as hex), the pool PDA seed keeps its
+bytes as a byte-array literal, and the verbatim port is generated from the
+contract source through a deterministic rename map
+(`scripts/port_coffer_math.py`; the same map is applied by
+`tests/coffer_source_parity.rs` before comparing).
+
+### What is implemented
+
+| Layer | Where |
+| --- | --- |
+| Verbatim math port | `src/coffer/{constants,math/*}.rs` are byte-for-byte copies of the contract modules (only `use` lines differ); `src/coffer/swap.rs` embeds the swap handler's guard / fee / curve / surge-fee / payout / state-update segments verbatim; `src/coffer/{state,errors,prelude}.rs` mirror the Anchor-only pieces. `tests/coffer_source_parity.rs` diffs all of it against the contract source and fails on drift. Regenerate with `python3 scripts/port_coffer_math.py [<Coffer src dir>]`. The `coffer` module is `#[rustfmt::skip]` for that reason. |
+| Quote layer | `src/coffer_venue/mod.rs` — `CofferVenue` (`PoolProtocol::Coffer`, displayed as `"Coffer"`), `parse_pool_creations`, `update_state` (pool + mints + Clock sysvar), `directions_num`, `quote`, `generate_swap_instruction`, `AddressLookupTableTrait`. `price.rs` is the closed-form marginal price; `instruction.rs` the `swap` builder. |
+| Route builder | `Venue::Coffer { token_in_index, token_out_index }` in `src/swap_route/mod.rs`. |
+| Program layer | `program-template/.../venues/coffer.rs` CPI adapter, dispatch in `swap_route_v3.rs`, parity cases in `tests/venue_parity.rs`, route simulation in `tests/your_venue_route.rs`. |
+| Production bytecode | `programs/8iQtGj9mcUfFUGaiCpPy89swC3s8YTC8FhVZWfgeZhwu.so` (sha256 `5128c578…`, committed, pinned by the fixture suite) so the offline fixtures run the exact mainnet build. |
+
+Quote semantics: every on-chain guard runs first; `amount == 0` returns zero
+output and the spot price; a swap the sell-off window would reject
+(`MaxSelloffExceeded`) or whose curve output exceeds the LP-owned balance
+(`AmountOutExceedsBalance`) is a **partial fill** (`not_enough_liquidity =
+true`, `amount` = the largest input the program accepts, `expected_output` at
+that size); `ZeroFeeAmount` and arithmetic failures are errors; the handler's
+post-swap balance updates are re-run as overflow checks so the quote fails on
+exactly the inputs the program rejects. `minimum_amount_out` is 0 (the router
+enforces slippage on the route). `price = d(user_output)/d(amount_in)`, the
+derivative of the continuous curve times `(1 - surge_rate)` at the post-swap
+window position.
+
+### Test tiers
+
+```bash
+# 1. no RPC: unit tests, verbatim-port parity, scorecard, enum parity
+make check-structure
+cargo test --release --test coffer_source_parity   # needs ../contracts or COFFER_CONTRACT_SRC=<program crate>/src
+
+# 2. no RPC: LiteSVM fixtures against the pinned production ELF
+cargo test --release --test coffer_fixtures -- --nocapture
+
+# 3. RPC-gated: the shared suite on live pools, and the route program
+export SOLANA_RPC_URL=https://...
+make build-program && make dump-programs
+make test-example
+make test-venue            # COFFER_TEST_POOL=<pubkey> narrows to one pool
+cargo run --release --example mvt_diag   # per-direction MVT residual report
+```
+
+Tier 2 builds synthetic pools with the real layout, PDA seeds and ATAs, and
+proves against the production program: exact payouts and exact post-swap pool
+state on size grids; the exact `MaxSelloffExceeded` boundary (largest passing
+input = the reported partial-fill amount); split-vs-whole sequences with a
+state refresh between legs; window rotation after one and two periods incl.
+the carry-over rescale when the snapshot changes; five surge-curve shapes
+(kinked, no kink, threshold 0, near-100% threshold, 20/80 weights); a zero-fee
+pool; dust inputs; output capped by the LP balance (protocol fees excluded);
+deactivated input token / disabled pool / disabled swaps; a 10-token pool with
+Token-2022 mints and two capped slots; the u64 balance ceiling.
+
+Live pools used by tier 3 (`tests/your_venue.rs`): `5dDez…` (4 tokens, a
+Token-2022 mint), `CSgrE…` (9 tokens; slot 6 has a LIVE 10% sell-off cap with an
+80% → 25% surge curve), `BN4wp…` (80/20 weights), `AL4yx…` (LP balance far
+below the virtual balance). The route simulation uses `5dDez…` and `BN4wp…`.
+
+### Measured
+
+- Quote latency (Apple M-series, `--release`): ~0.2 µs for a plain quote,
+  ~0.5 µs on a fixture grid, ~0.7 µs with the cap and surge fee active
+  (`quote_latency_report`, `examples/quote_bench.rs`). The template's
+  `quoting_speed` test passes on all four live pools.
+- Exact on-chain parity: `bound_simulation` / `random_samples` pass on all four
+  live pools (200 random sizes per direction, 88 directions) and the route
+  simulation passes on every direction of both route pools.
+
+### Known limitations
+
+- **`mean_value_theorem` (shared suite) is red on two of the four live pools.**
+  The contract rounds the swap fee UP in *input* atoms, so the exact output
+  curve is a staircase with a flat step every `1/fee_rate` atoms. The shipped
+  test allows two *output* atoms of slack per chord; on directions that pay
+  more than ~2 output atoms per input atom (e.g. USDC → BONK, USDC → a
+  12-decimal mint) one input atom of fee rounding on a chord of 40–250 atoms
+  exceeds it. Measured: violations only at input sizes ≤ 110 809 atoms, worst
+  5.7% (2%-fee pool, ~50-atom chord containing one fee step); no pointwise
+  price can pass there (a chord with a step followed by one without forces
+  `p(b) ≤ chord₁ < chord₂ ≤ p(b)`). With one input atom of slack —
+  `atol = (2 + price_a) / (b - a)` — every one of the 88 directions passes with
+  zero violations (`examples/mvt_diag.rs`). The Raydium reference is unaffected
+  only because its output/input atom ratio is ~1.4.
+- The surge fee on-chain is a 4-segment, ceil-per-segment charge (conservative
+  by construction); `price` is the derivative of the continuous model. The
+  residual beyond the fee-rounding slack measured 7.3e-5 on the worst fixture
+  (`pricing_invariants_under_surge_with_residual_report`).
+- The window arithmetic uses the Clock sysvar captured at `update_state`; a
+  stale clock near a window boundary makes the off-chain window position differ
+  from the leader's. Refresh the clock with the pool.
+- Overflow of the vault *token account* (`vault + amount_in > u64::MAX`) is not
+  predicted from pool state alone; it needs more than `2^64 - vault` atoms.
+- `parse_pool_creations` targets the `main` instruction shape (mints in
+  `remaining_accounts`); pre-upgrade creations that passed a `tokens` vector
+  are not recognised.
+- Inactive tokens can still be bought; sidelined tokens (`actual_balance ==
+  0`) are excluded as outputs from `directions_num`.
+
+### Local-validator matrix (sell-off window + surge fee, end to end)
+
+`scripts/local-stand/` brings up a `solana-test-validator` with the production
+Coffer ELF at the mainnet program id, the Titan router built from
+`program-template` at `T1TAN…`, and the live `CofferPoolConfig` (`E9K7…`,
+`protocol_admin` rewritten to the local wallet so `set_pool_enabled` can be
+exercised). `local-stand setup` then creates local mints (BONK-like 5 dec,
+USDC-like 6 dec, SOL-like 9 dec, a metadata-only Token-2022 mint), the
+TitanPDA, and one real pool per configuration below — created, seeded and
+configured with the local wallet as pool admin — and writes
+`scripts/local-stand/stand.json`.
+
+```bash
+make build-program                 # router ELF for the validator
+scripts/local-stand/up.sh          # validator + mints + 26 pools (~2 min); prints the addresses
+scripts/local-stand/run-matrix.sh  # tiers 1-4 in order, logs in scripts/local-stand/logs/
+```
+
+Tiers (`tests/local_stand_matrix.rs`, `program-template/.../tests/local_stand_route.rs`):
+
+1. Titan's shared suite (all eight tests) on every static pool, plus
+   `construction` under the allocation guard;
+2. the program-template route simulation (`swap_route_v3` in LiteSVM) on every
+   static pool, every direction;
+3. REAL `swap_route_v3` transactions through the router on the validator for
+   every direction of every static pool at three sizes (lower bound,
+   geometric middle, upper bound), comparing the user's ATA delta AND the
+   post-swap pool account with `quote()` / `apply_swap`;
+4. dynamic sequences on dedicated pools: chunked sells (direct and routed)
+   until the window is full, the full window reported as unavailable while the
+   program reverts with `MaxSelloffExceeded`, buy side unaffected, surge fee
+   accrual in the output token's protocol bucket, the 100%-fee exhaustion
+   point, real-time rotation on a 20-second window, and the
+   `set_token_active` / `set_swaps_enabled` / `set_pool_enabled` toggles.
+
+Configuration matrix (BONK is slot 0 and capped; `(cap, period, threshold,
+low/mid/high, kink)`; see `CASES` in `src/bin/local_stand.rs`):
+
+| case | pool | config |
+| --- | --- | --- |
+| a_cap_only | 50/50 | cap 10%, surge off |
+| b_thr0_kink50 | 50/50 | cap 10%, thr 0, 0/50/100%, kink 50 |
+| c_thr80_nokink | 50/50 | cap 10%, thr 80%, 0/0/100% |
+| d_thr80_full_fee | 50/50 | cap 10%, thr 80%, 100/100/100% |
+| e_thr999_nokink | 50/50 | cap 10%, thr 99.9%, 0/50/100% (kink 99 with this threshold is rejected on-chain) |
+| e2_thr9899_kink99 | 50/50 | cap 10%, thr 98.99%, 0/50/100%, kink 99 |
+| f_flat | 50/50 | cap 10%, thr 50%, 5/5/5%, kink 60 (kink 50 is rejected: must exceed the threshold) |
+| g_kink1 / g_kink99 | 50/50 | cap 10%, thr 0, 0/20/100%, kink 1 / 99 (kink 100 is rejected on-chain) |
+| h_cap100 / h_cap1 | 50/50 | cap 100% / 1%, thr 50%, 0/25/50%, kink 75 |
+| i_short_period | 50/50 | cap 10%, period 20 s, thr 50%, 0/20/50%, kink 80 |
+| j_surge_no_cap | 50/50 | cap 0 with a surge curve configured (inert) |
+| k_inactive | 50/50 | config b + `set_token_active(BONK, false)` |
+| l_swaps_off / l_pool_off | 50/50 | config a + swaps disabled / pool disabled |
+| w8020_b / w8020_c | 80/20 | configs b / c |
+| m_four_token | SOL/BONK/USDC/MEME22 | BONK cap 10% thr 50% 0/10/30% kink 70; MEME22 (Token-2022) cap 5% thr 80% 0/0/50% |
+| dyn_* | 50/50, 80/20 | dedicated copies of b, c, d, the 20 s pool and b for the sequence tests |
+
+Results of the last clean run (`scripts/local-stand/results/`, reproduced by
+`up.sh && run-matrix.sh`; 26 pools, 4 mints):
+
+| tier | result |
+| --- | --- |
+| 1 shared suite | 19 static pools × 8 tests: everything passes except `mean_value_theorem` on the 17 pools that have a USDC → BONK direction (see below); `construction` also passes under the allocation guard |
+| 2 route simulation | 19/19 pools, every direction, 430 legs exact |
+| 3 real routed txs | 126 `swap_route_v3` transactions on the validator, 126 exact against the quote AND the predicted pool account (one, on the 20 s pool, exact once the venue clock is set to the block time); `l_swaps_off` / `l_pool_off`: quote refuses, program reverts 6021 / 6020; `k_inactive`: BONK direction absent, selling reverts 6054, buying exact; max 284 428 CU per routed tx with the surge active |
+| 4 dynamic | windows filled in chunks on b / c / 80-20 c (direct) and b (routed, 10 chunks crossing the kink) with every chunk exact; full window → direction absent, `bounds` errors, quote reports 0 fillable, program reverts `MaxSelloffExceeded`, buy side exact; surge accrual in the USDC protocol bucket equals the sum of the predicted per-chunk fees (2 194 516 753 atoms on b); 100%-fee config: exhaustion point executed exactly, selling past it pays 0 on-chain; 20 s window: fill, rotate after one period (carry-over headroom sold exactly), fresh cap after two; deactivate / swaps-off / pool-off toggles behave as quoted and revert 6054 / 6021 / 6020 |
+
+Findings from the matrix:
+
+- A routed Coffer leg with the surge fee active does NOT fit the router's
+  default 200 000 CU: the router spends ~45k CU creating the TitanPDA ATAs and
+  the 4-segment surge charge costs the swap four extra curve evaluations
+  (`<program> … consumed 123388 of 123388 compute units … exceeded CUs
+  meter`). Measured per routed tx: 160–168k CU without surge, 250–285k with it.
+  The LiteSVM harness simulates at 1.4M CU, which is why the route simulation
+  never showed it. Tier 3/4 prepend `SetComputeUnitLimit(600_000)`; Titan's
+  router client must budget accordingly.
+- The sell-off window is a function of the clock. A quote at clock `t` and a
+  transaction landing at block time `t' > t` differ when the window rotates in
+  between (20 s pool) or when a non-zero carry-over decays with the surge
+  active; tier 3/4 re-quote with the venue clock set to the block time and
+  report those as "exact only at block time" (1 of 126 routed txs, on the
+  20 s pool). Refresh the Clock together with the pool.
+- With a curve that reaches 100% at full fill (b, c, g, e, w8020 …) the last
+  atom(s) of the window cannot be sold for any output; the venue refuses them
+  (zero fillable) while the program accepts them and pays 0. Selling past the
+  100%-fee threshold of config d pays 0 as well; the venue reports the
+  threshold as the fillable amount.
+- The contract rejects a kink at or below the threshold and a kink of 100
+  (`InvalidSurgeFeeConfig`): "threshold 99.9% with kink 99", "kink 100" and
+  "threshold 50% with kink 50" are not deployable; the matrix uses the closest
+  legal shapes (e, e2, f, g_kink99).
+- `mean_value_theorem` fails on every pool with USDC → BONK (5 000 BONK atoms
+  per USDC atom): the ceil'd input-side fee staircase, see above (worst 6.0e-3
+  on the 80/20 pools, all at sizes ≤ ~2e5 USDC atoms). On the surge-active
+  configs a second residual appears beyond the input-atom slack — the
+  4-segment surge charge over-collects by an amount that varies with size:
+  1.05e-4 (b), 1.21e-4 (g_kink99), 2.83e-5 (w8020_b) and 1.71e-3 on g_kink1
+  (a kink at 1% makes the first segment's average rate the coarsest); zero on
+  every other configuration.

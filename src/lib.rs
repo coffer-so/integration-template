@@ -7,5 +7,6 @@ pub mod account_caching;
 pub mod coffer;
 pub mod coffer_venue;
 pub mod example;
+pub mod local_stand;
 pub mod swap_route;
 pub mod trading_venue;
