@@ -4,11 +4,12 @@
 //! deactivated token or a disabled switch, so this suite builds synthetic pools
 //! (the real account layout, real PDA seeds, real ATAs and mints) and runs
 //! the PRODUCTION Coffer ELF (`programs/8iQt….so`, sha256-pinned below)
-//! against them in LiteSVM. Every case asserts that the user's on-chain
-//! `amount_out` equals `quote().expected_output` exactly, and that the
-//! program's post-swap pool account equals the port's `apply_swap` prediction
-//! byte for byte (window rotation, snapshot capture, carry-over rescale,
-//! protocol-fee buckets included).
+//! against them in LiteSVM. Executed swaps assert that the user's on-chain
+//! `amount_out` equals the raw contract port exactly, and that the program's
+//! post-swap pool account equals the port's `apply_swap` prediction byte for
+//! byte (window rotation, snapshot capture, carry-over rescale, protocol-fee
+//! buckets included). Adapter quotes are checked inside its supported domain;
+//! raw surge parity remains covered beyond that domain.
 //!
 //! It needs no RPC — only the committed program binary — so it always runs.
 
@@ -34,10 +35,9 @@ use solana_transaction::Transaction;
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 
 use titan_integration_template::account_caching::{AccountCacheError, AccountsCache};
-use titan_integration_template::coffer::constants::PERCENT_SCALE;
 use titan_integration_template::coffer::errors::ErrorCode;
 use titan_integration_template::coffer::state::{AssetConfig, CofferPool};
-use titan_integration_template::coffer::swap::{apply_swap, quote_exact_in};
+use titan_integration_template::coffer::swap::{SwapOutcome, apply_swap, quote_exact_in};
 use titan_integration_template::coffer_venue::{COFFER_PROGRAM_ID, CofferVenue};
 use titan_integration_template::trading_venue::error::TradingVenueError;
 use titan_integration_template::trading_venue::{
@@ -290,17 +290,15 @@ impl Fixture {
         pool_account.data = pool.to_account_data();
         svm.set_account(pool_key, pool_account).unwrap();
 
+        let venue =
+            CofferVenue::from_account(&pool_key, &svm.get_account(&pool_key).unwrap()).unwrap();
         let mut fx = Self {
             svm,
             user,
             pool_key,
             mints,
             token_programs,
-            venue: CofferVenue::from_account(
-                &pool_key,
-                &svm_account(&svm_placeholder(), &pool_key),
-            )
-            .unwrap_or_else(|_| unreachable!()),
+            venue,
         };
         fx.set_clock(NOW);
         fx.refresh();
@@ -321,14 +319,11 @@ impl Fixture {
     /// Re-read the pool, mints and clock from the SVM into the venue — what
     /// Titan does between swaps.
     fn refresh(&mut self) {
-        let pool_account = self.svm.get_account(&self.pool_key).unwrap();
-        let mut venue = CofferVenue::from_account(&self.pool_key, &pool_account).unwrap();
-        let keys = venue.get_required_pubkeys_for_update().unwrap();
+        let keys = self.venue.get_required_pubkeys_for_update().unwrap();
         let cache = SvmCache::snapshot(&self.svm, &keys);
-        futures_block_on(venue.update_state(&cache)).unwrap();
-        assert!(venue.initialized());
-        assert_eq!(venue.now(), self.now());
-        self.venue = venue;
+        futures_block_on(self.venue.update_state(&cache)).unwrap();
+        assert!(self.venue.initialized());
+        assert_eq!(self.venue.now(), self.now());
     }
 
     fn pool(&self) -> CofferPool {
@@ -409,6 +404,14 @@ impl Fixture {
         );
         assert_eq!(quote.amount, amount);
 
+        let outcome = self.check_raw_swap(i, j, amount);
+        assert_eq!(outcome.amount_out_user, quote.expected_output);
+        quote
+    }
+
+    /// Verify the complete contract port independently of Titan's supported
+    /// domain. Surge swaps outside that domain must retain exact ELF parity.
+    fn check_raw_swap(&mut self, i: usize, j: usize, amount: u64) -> SwapOutcome {
         let pool_before = self.pool();
         let outcome = quote_exact_in(
             &pool_before,
@@ -420,16 +423,14 @@ impl Fixture {
             self.now(),
         )
         .unwrap();
-        assert_eq!(outcome.amount_out_user, quote.expected_output);
         let mut predicted = pool_before;
         apply_swap(&mut predicted, i as u8, j as u8, &outcome).unwrap();
-
-        let received = self.swap(i, j, amount).unwrap_or_else(|code| {
-            panic!("{i}->{j} amount {amount}: program failed with {code} but quote was {quote:?}")
-        });
+        let received = self
+            .swap(i, j, amount)
+            .unwrap_or_else(|code| panic!("{i}->{j} amount {amount}: program failed with {code}"));
         assert_eq!(
-            received, quote.expected_output,
-            "{i}->{j} amount {amount}: on-chain != quote"
+            received, outcome.amount_out_user,
+            "{i}->{j} amount {amount}: on-chain != raw port"
         );
         assert_eq!(
             self.pool(),
@@ -437,24 +438,20 @@ impl Fixture {
             "{i}->{j} amount {amount}: post-swap pool state differs"
         );
         self.refresh();
-        quote
+        outcome
     }
-}
 
-// `Fixture::with_pool` needs a venue before the SVM exists; these two helpers
-// let the struct literal compile — the real venue is built by `refresh()`.
-fn svm_placeholder() -> LiteSVM {
-    LiteSVM::default()
-}
-fn svm_account(_svm: &LiteSVM, pool_key: &Pubkey) -> Account {
-    let pool = CofferPool {
-        token_count: 2,
-        ..Default::default()
-    };
-    let mut account = Account::new(0, CofferPool::LEN, &COFFER_PROGRAM_ID);
-    account.data = pool.to_account_data();
-    let _ = pool_key;
-    account
+    /// Inject an account update, then refresh the SAME venue. These snapshots
+    /// model RM/admin writes; the local-validator suite executes the real
+    /// management instructions separately.
+    fn update_pool(&mut self, patch: impl FnOnce(&mut CofferPool)) {
+        let mut pool = self.pool();
+        patch(&mut pool);
+        let mut account = self.svm.get_account(&self.pool_key).unwrap();
+        account.data = pool.to_account_data();
+        self.svm.set_account(self.pool_key, account).unwrap();
+        self.refresh();
+    }
 }
 
 fn futures_block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -606,45 +603,54 @@ fn max_selloff_boundary_is_exact() {
     fx.check_swap(1, 0, 1_000_000);
 }
 
-/// A partial fill reports the same fillable amount whether the request is
-/// just above the headroom or far above it, and that amount never includes
-/// the input atoms a 100%-at-full-fill surge curve would take entirely: the
-/// `MaxSelloffExceeded` path applies the same exhaustion pull-back as the
-/// in-cap path, and the reported amount executes exactly on-chain.
+/// The end of the last untaxed fill-ratio cell is included exactly. Every
+/// larger request returns that same executable amount, including requests
+/// beyond the contract's hard sell-off cap.
 #[test]
-fn partial_fill_above_headroom_stops_at_the_surge_exhaustion_point() {
+fn partial_fill_stops_at_exact_zero_surge_boundary() {
     let mut fx = Fixture::new(
         3_000,
         &[
             TokenSpec::new(9, 5_000, 10_000_000_000_000, 10_000_000_000_000)
                 .cap(1_000)
-                .surge(0, 0, 5_000, 10_000, 50),
+                .surge(6_000, 1_000, 5_000, 10_000, 80),
             TokenSpec::new(6, 5_000, 10_000_000_000, 10_000_000_000),
         ],
     );
-    let cap = 10_000_000_000_000 / 10;
-    // Two request sizes in the `MaxSelloffExceeded` branch and one in the
-    // in-cap branch that saturates at 100%: all three agree.
-    let far = fx.quote(0, 1, u64::MAX / 8).unwrap();
-    let near = fx.quote(0, 1, cap + 1).unwrap();
-    let at_cap = fx.quote(0, 1, cap).unwrap();
-    assert!(far.not_enough_liquidity && near.not_enough_liquidity && at_cap.not_enough_liquidity);
-    assert_eq!(far.amount, near.amount);
-    assert_eq!(far.amount, at_cap.amount);
-    assert!(far.amount > 0 && far.amount < cap, "{far:?}");
-    assert_eq!(far.expected_output, at_cap.expected_output);
+    let cap = 1_000_000_000_000u64;
+    let limit = 600_099_999_999u64;
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(limit));
+    let at_limit = fx.quote(0, 1, limit).unwrap();
+    assert!(!at_limit.not_enough_liquidity);
+    for amount in [limit - 1, limit] {
+        let q = fx.quote(0, 1, amount).unwrap();
+        assert_eq!(q.amount, amount);
+        assert!(!q.not_enough_liquidity);
+        let raw = quote_exact_in(&fx.pool(), amount, 0, 1, 9, 6, fx.now()).unwrap();
+        assert_eq!(raw.surge_fee_amount, 0);
+        assert_eq!(q.expected_output, raw.amount_out_user);
+    }
     assert!(
-        far.price > 0.0,
-        "the reported edge is not yet at a 100% rate"
+        quote_exact_in(&fx.pool(), limit + 1, 0, 1, 9, 6, fx.now())
+            .unwrap()
+            .surge_fee_amount
+            > 0
     );
-    // Requesting the reported amount directly is a full fill of that size.
-    let direct = fx.quote(0, 1, far.amount).unwrap();
-    assert!(!direct.not_enough_liquidity);
-    assert_eq!(direct.expected_output, far.expected_output);
-    // One atom more already buys nothing.
-    let more = fx.quote(0, 1, far.amount + 1).unwrap();
-    assert!(more.not_enough_liquidity && more.amount == far.amount);
-    fx.check_swap(0, 1, far.amount);
+    for requested in [limit + 1, cap, cap + 1, u64::MAX / 8] {
+        let q = fx.quote(0, 1, requested).unwrap();
+        assert!(q.not_enough_liquidity);
+        assert_eq!(q.amount, limit);
+        assert_eq!(q.expected_output, at_limit.expected_output);
+        assert_eq!(q.price, at_limit.price);
+    }
+    let (_, upper) = fx.venue.bounds(0, 1).unwrap();
+    assert!(upper <= limit && limit - upper <= 100);
+    fx.check_swap(0, 1, limit);
+    let exhausted = fx.quote(0, 1, 1).unwrap();
+    assert!(exhausted.not_enough_liquidity);
+    assert_eq!((exhausted.amount, exhausted.expected_output), (0, 0));
+    assert!(fx.venue.bounds(0, 1).is_err());
+    assert!(fx.venue.directions_num().contains(&(0, 1)));
 }
 
 /// Split versus whole: two sequential sells (re-reading the pool and calling
@@ -665,14 +671,17 @@ fn split_sequence_matches_onchain_with_state_refresh() {
     let parts = [cap * 3 / 10, cap * 3 / 10, cap * 3 / 10];
     let mut headroom = cap;
     for part in parts {
-        let q = fx.check_swap(0, 1, part);
+        let q = fx.check_raw_swap(0, 1, part);
         headroom -= part;
-        let probe = fx.quote(0, 1, u64::MAX / 8).unwrap();
-        assert!(probe.not_enough_liquidity);
-        assert_eq!(probe.amount, headroom, "headroom after {part}");
+        assert_eq!(
+            titan_integration_template::coffer::swap::selloff_headroom(&fx.pool(), 0, fx.now())
+                .unwrap(),
+            Some(headroom),
+            "headroom after {part}"
+        );
         eprintln!(
             "part {part}: out {} surge in state {}",
-            q.expected_output,
+            q.amount_out_user,
             fx.pool().tokens[1].dynamics.protocol_fees_owed
         );
     }
@@ -680,7 +689,7 @@ fn split_sequence_matches_onchain_with_state_refresh() {
     // OUTPUT token's protocol bucket.
     assert!(fx.pool().tokens[1].dynamics.protocol_fees_owed > 0);
     // Remaining headroom executes exactly, then the window is full.
-    fx.check_swap(0, 1, headroom);
+    fx.check_raw_swap(0, 1, headroom);
     assert_eq!(fx.swap(0, 1, 1), Err(ErrorCode::MaxSelloffExceeded.code()));
 }
 
@@ -781,29 +790,11 @@ fn surge_fee_shapes_match_onchain_exactly() {
         // Sizes from 1 atom up to the whole cap (crossing the threshold), then
         // the exact boundary.
         for amount in grid(1, cap, 24) {
-            let q = fx.quote(0, 1, amount).unwrap();
-            let outcome = quote_exact_in(&fx.pool(), amount, 0, 1, 6, 9, fx.now()).unwrap();
+            let outcome = fx.check_raw_swap(0, 1, amount);
             if outcome.surge_fee_amount > 0 {
                 surged += 1;
-                assert!(q.expected_output < outcome.amount_out);
+                assert!(outcome.amount_out_user < outcome.amount_out);
             }
-            // Fresh fixture per size so every sample starts at an empty window.
-            // A quote whose post-swap surge rate reaches 100% reports the
-            // exhaustion point as a partial fill; execute THAT amount.
-            let executed = if q.not_enough_liquidity {
-                q.amount
-            } else {
-                amount
-            };
-            assert!(
-                executed > 0,
-                "{name}: amount {amount} reported nothing fillable"
-            );
-            let received = fx.swap(0, 1, executed).unwrap();
-            assert_eq!(
-                received, q.expected_output,
-                "{name}: amount {amount} (executed {executed})"
-            );
             let vb_snapshot = fx.pool().tokens[0].dynamics.selloff_vb_snapshot;
             assert_eq!(
                 vb_snapshot, 2_000_000_000_000,
@@ -841,7 +832,8 @@ fn surge_fee_on_partially_filled_window() {
     // Bring the window to 50% (below the 60% threshold) first.
     fx.check_swap(0, 1, cap / 2);
     let (lb, ub) = fx.venue.bounds(0, 1).unwrap();
-    assert!(cap / 2 - ub <= 100);
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(100_099_999_999));
+    assert!(ub <= 100_099_999_999);
     let mut prev_out = 0;
     for amount in grid(lb, ub, 16) {
         let q = fx.quote(0, 1, amount).unwrap();
@@ -853,7 +845,7 @@ fn surge_fee_on_partially_filled_window() {
     }
     // Execute a chain of sells that crosses the threshold and ends at the cap.
     for amount in [cap / 10, cap / 10, cap / 10, cap / 10, cap / 10] {
-        fx.check_swap(0, 1, amount);
+        fx.check_raw_swap(0, 1, amount);
     }
     assert_eq!(fx.swap(0, 1, 1), Err(ErrorCode::MaxSelloffExceeded.code()));
     assert!(fx.pool().tokens[1].dynamics.protocol_fees_owed > 0);
@@ -1066,78 +1058,59 @@ fn ten_token_pool_many_directions() {
     assert!(fx.pool().tokens[3].dynamics.current_selloff > 0);
 }
 
-/// Pricing invariants on surge fixtures, with the residual reported.
-///
-/// `price` is the derivative of the continuous model (`price.rs`). Two
-/// discretisations separate it from the exact integer function: the ceil'd
-/// input-side fee (one input atom per fee step, worth `price` output atoms)
-/// and the 4-segment surge charge (over-collects by an amount that varies
-/// with size). The assertion uses the shipped MVT tolerance PLUS one input
-/// atom of fee rounding; the surge residual on top of that is printed.
+/// On the advertised domain the contract charges no surge, so prices and
+/// outputs satisfy the shared MVT tolerance without a surge residual budget.
+/// Zero LP fee isolates this policy from input-fee rounding.
 #[test]
-fn pricing_invariants_under_surge_with_residual_report() {
-    let cases = [
-        (
-            "50/50 surge 80%",
-            (5_000u64, 5_000u64),
-            (8_000u16, 100u16, 1_000u16, 3_000u16, 90u8),
-        ),
-        (
-            "80/20 surge 60%",
-            (8_000, 2_000),
-            (6_000, 0, 500, 2_500, 80),
-        ),
-        ("20/80 surge 0%", (2_000, 8_000), (0, 0, 300, 4_000, 50)),
-    ];
-    let mut worst_surge_residual: f64 = 0.0;
-    for (name, (w_in, w_out), (thr, lo, mid, hi, kink)) in cases {
+fn zero_surge_domain_satisfies_pricing_invariants() {
+    for (name, w_in, w_out, threshold) in [
+        ("50/50", 5_000, 5_000, 8_000),
+        ("80/20", 8_000, 2_000, 6_000),
+        ("20/80 threshold zero", 2_000, 8_000, 0),
+        ("95/5 steep kink", 9_500, 500, 0),
+    ] {
         let fx = Fixture::new(
-            3_000,
+            0,
             &[
-                TokenSpec::new(6, w_in, 2_000_000_000_000, 2_000_000_000_000)
+                TokenSpec::new(9, w_in, 2_000_000_000_000, 2_000_000_000_000)
                     .cap(5_000)
-                    .surge(thr, lo, mid, hi, kink),
+                    .surge(threshold, 0, 1_000, 10_000, 1),
                 TokenSpec::new(9, w_out, 8_000_000_000_000, 8_000_000_000_000),
             ],
         );
         let (lb, ub) = fx.venue.bounds(0, 1).unwrap();
-        let points = grid(lb, ub, 64);
-        // price monotone (non-increasing), positive
-        let mut prev = f64::INFINITY;
+        let points = grid(lb, ub, 128);
         for &x in &points {
-            let p = fx.quote(0, 1, x).unwrap().price;
-            assert!(p > 0.0);
-            assert!(
-                p <= prev * (1.0 + 1e-3),
-                "{name}: price rose at {x}: {prev} -> {p}"
-            );
-            prev = p;
+            let q = fx.quote(0, 1, x).unwrap();
+            assert!(!q.not_enough_liquidity);
+            assert!(q.price.is_finite() && q.price > 0.0);
+            let raw = quote_exact_in(&fx.pool(), x, 0, 1, 9, 9, fx.now()).unwrap();
+            assert_eq!(raw.surge_fee_amount, 0, "{name}: input {x}");
+            assert_eq!(raw.amount_out_user, q.expected_output);
         }
-        // MVT with the input-atom-aware slack; measure the surge residual.
-        let mut max_violation: f64 = 0.0;
-        for w in points.windows(2) {
-            let (a, b) = (w[0], w[1]);
+        for pair in points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
             let (qa, qb) = (fx.quote(0, 1, a).unwrap(), fx.quote(0, 1, b).unwrap());
-            if qb.expected_output <= qa.expected_output {
-                continue;
-            }
+            assert!(
+                qb.expected_output >= qa.expected_output,
+                "{name}: output fell on [{a}, {b}]"
+            );
+            assert!(
+                qb.price <= qa.price * (1.0 + 1e-5),
+                "{name}: price increased"
+            );
             let chord = (qb.expected_output - qa.expected_output) as f64 / (b - a) as f64;
-            let slack = (2.0 + qa.price) / (b - a) as f64;
-            let over = (chord - (qa.price * (1.0 + 1e-5) + slack)) / qa.price;
-            let under = ((qb.price * (1.0 - 1e-5) - slack) - chord) / qb.price;
-            max_violation = max_violation.max(over).max(under);
+            let atol = 2.0 / (b - a) as f64;
+            assert!(
+                chord <= qa.price * (1.0 + 1e-5) + atol,
+                "{name}: chord above left price [{a}, {b}]"
+            );
+            assert!(
+                chord >= qb.price * (1.0 - 1e-5) - atol,
+                "{name}: chord below right price [{a}, {b}]"
+            );
         }
-        eprintln!("{name}: surge MVT residual beyond fee-rounding slack = {max_violation:.3e}");
-        worst_surge_residual = worst_surge_residual.max(max_violation);
     }
-    eprintln!("worst surge MVT residual across cases: {worst_surge_residual:.3e}");
-    // The segmented surge charge is conservative by construction; the chord
-    // can dip below the continuous derivative by the over-collection delta.
-    // Pin the measured envelope so a regression is visible.
-    assert!(
-        worst_surge_residual < 5e-3,
-        "surge residual grew: {worst_surge_residual}"
-    );
 }
 
 /// Quote latency on the fixtures (surge on and off), reported.
@@ -1168,153 +1141,179 @@ fn quote_latency_report() {
     }
 }
 
-/// Zero input: zero output and a positive spot price, also when the window
-/// already sits inside the surge zone.
+/// Once an external swap enters the surge zone, the same venue must stop
+/// offering positive fills. A zero-input quote is only a finite sentinel;
+/// clock rotation later restores the direction without reconstructing it.
 #[test]
-fn zero_input_spot_price_inside_surge_zone() {
+fn surge_exhaustion_and_clock_recovery_on_same_venue() {
     let mut fx = Fixture::new(
         3_000,
         &[
-            TokenSpec::new(6, 5_000, 2_000_000_000_000, 2_000_000_000_000)
+            TokenSpec::new(9, 5_000, 2_000_000_000_000, 2_000_000_000_000)
                 .cap(5_000)
                 .surge(5_000, 1_000, 2_000, 5_000, 75),
             TokenSpec::new(9, 5_000, 8_000_000_000_000, 8_000_000_000_000),
         ],
     );
-    let spot_empty = fx.quote(0, 1, 0).unwrap();
-    assert_eq!(spot_empty.expected_output, 0);
-    // Fill 70% of the window: the marginal rate now carries the surge rate.
-    fx.check_swap(0, 1, 1_000_000_000_000 * 7 / 10);
-    let spot_surged = fx.quote(0, 1, 0).unwrap();
-    assert_eq!(spot_surged.expected_output, 0);
-    assert!(spot_surged.price > 0.0);
-    assert!(
-        spot_surged.price < spot_empty.price * 0.9,
-        "{} vs {}",
-        spot_surged.price,
-        spot_empty.price
-    );
-    let _ = PERCENT_SCALE;
+    fx.check_raw_swap(0, 1, 700_000_000_000);
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(0));
+    let q = fx.quote(0, 1, 1).unwrap();
+    assert!(q.not_enough_liquidity);
+    assert_eq!((q.amount, q.expected_output), (0, 0));
+    assert!(fx.venue.bounds(0, 1).is_err());
+    let spot = fx.quote(0, 1, 0).unwrap();
+    assert_eq!((spot.amount, spot.expected_output), (0, 0));
+    assert!(spot.price.is_finite());
+    assert!(fx.venue.directions_num().contains(&(0, 1)));
+    fx.set_clock(NOW + 2 * PERIOD as i64);
+    fx.refresh();
+    assert!(fx.venue.fill_limit(0, 1).unwrap() > 0);
+    fx.check_swap(0, 1, 1_000_000);
 }
 
-/// The contract's segmented surge charge can grow faster than the curve pays
-/// out: at 95/5 weights with a 0 → 25% curve the user's NET output peaks
-/// well inside the window and a larger input then receives FEWER atoms
-/// (963 537 089 473 at 4e11 vs 960 973 264 083 at 4.9e11, reproduced here
-/// from the port). Titan needs `f` non-decreasing and `price` positive on
-/// the quotable domain, so the venue ends the domain at the net-output peak:
-/// requests past it are partial fills at the peak, `bounds` stops there, the
-/// peak executes exactly on-chain, and on the domain the output is monotone
-/// up to the contract's own rate quantum (0.01% of a segment's output).
+/// Reproduce the measured downward output steps against the ELF, then prove
+/// both offending inputs are outside the adapter's advertised domain.
 #[test]
-fn surge_net_output_peak_ends_the_quotable_domain() {
-    // (label, w_in, w_out, slope_high, reference (x, net(x), net(4.9e11)))
-    type Case = (&'static str, u64, u64, u16, Option<(u64, u64, u64)>);
-    let cases: [Case; 4] = [
+fn contract_output_declines_are_excluded_from_titan_quotes() {
+    for (label, cap_pct, mid, high, kink, a, expected_a, b, expected_b) in [
         (
-            "95/5 0-25%",
-            9_500,
-            500,
-            2_500,
-            Some((400_000_000_000, 963_537_089_473, 960_973_264_083)),
-        ),
-        ("95/5 0-100%", 9_500, 500, 10_000, None),
-        ("50/50 0-100%", 5_000, 5_000, 10_000, None),
-        ("5/95 0-100%", 500, 9_500, 10_000, None),
-    ];
-    for (label, w0, w1, high, reference) in cases {
-        let mut fx = Fixture::new(
+            "95/5 broad decline",
+            5_000,
             0,
-            &[
-                TokenSpec::new(9, w0, 1_000_000_000_000, 1_000_000_000_000)
-                    .cap(5_000)
-                    .surge(0, 0, 0, high, 0),
-                TokenSpec::new(9, w1, 1_000_000_000_000, 1_000_000_000_000),
-            ],
-        );
-        let cap = 500_000_000_000u64;
-        let net = |fx: &Fixture, x: u64| {
-            quote_exact_in(&fx.pool(), x, 0, 1, 9, 9, fx.now())
-                .unwrap()
-                .amount_out_user
-        };
-        if let Some((x, at_x, at_490)) = reference {
-            assert_eq!(net(&fx, x), at_x, "{label}: reviewer's number at 4e11");
+            2_500,
+            0,
+            400_000_000_000,
+            963_537_089_473,
+            490_000_000_000,
+            960_973_264_083,
+        ),
+        (
+            "95/5 steep kink",
+            10_000,
+            10_000,
+            10_000,
+            1,
+            9_599_999_999,
+            90_138_673_999,
+            9_600_999_999,
+            88_709_857_064,
+        ),
+    ] {
+        assert!(b > a && expected_b < expected_a);
+        for (amount, expected) in [(a, expected_a), (b, expected_b)] {
+            let mut fx = Fixture::new(
+                0,
+                &[
+                    TokenSpec::new(9, 9_500, 1_000_000_000_000, 1_000_000_000_000)
+                        .cap(cap_pct)
+                        .surge(0, 0, mid, high, kink),
+                    TokenSpec::new(9, 500, 1_000_000_000_000, 1_000_000_000_000),
+                ],
+            );
+            let limit = fx.venue.fill_limit(0, 1).unwrap();
+            assert!(limit < a, "{label}: incompatible inputs remain advertised");
+            let q = fx.quote(0, 1, amount).unwrap();
+            assert!(q.not_enough_liquidity);
+            assert_eq!(q.amount, limit);
+            let (_, ub) = fx.venue.bounds(0, 1).unwrap();
+            assert!(ub <= limit);
             assert_eq!(
-                net(&fx, 490_000_000_000),
-                at_490,
-                "{label}: reviewer's number at 4.9e11"
+                fx.check_raw_swap(0, 1, amount).amount_out_user,
+                expected,
+                "{label}"
             );
         }
-        let peak = fx.venue.fill_limit(0, 1).expect("surge-limited direction");
-        assert!(peak > 0 && peak <= cap, "{label}: peak {peak}");
-        // Nothing on a coarse grid beats the peak by more than the rate
-        // quantum's sawtooth, and past it the output falls.
-        let peak_net = net(&fx, peak);
-        let quantum = |v: u64| v as f64 * 2e-4;
-        let mut worst_dip_rel: f64 = 0.0;
-        let mut prev = 0u64;
-        for k in 1..=200u64 {
-            let x = peak * k / 200;
-            let v = net(&fx, x);
-            assert!(
-                v as f64 <= peak_net as f64 + quantum(peak_net),
-                "{label}: net({x}) = {v} > net(peak) = {peak_net}"
-            );
-            if v < prev {
-                worst_dip_rel = worst_dip_rel.max((prev - v) as f64 / prev as f64);
-            }
-            prev = v;
-        }
-        assert!(
-            worst_dip_rel < 2e-4,
-            "{label}: sawtooth below the peak {worst_dip_rel:.2e}"
-        );
-        if peak < cap {
-            assert!(net(&fx, cap) as f64 <= peak_net as f64 + quantum(peak_net));
-        }
-        // Requests beyond the peak: the same partial fill at the peak, with a
-        // positive price; requests at/below it: full fills.
-        let q_cap = fx.quote(0, 1, cap).unwrap();
-        let q_far = fx.quote(0, 1, u64::MAX / 8).unwrap();
-        if peak < cap {
-            assert!(
-                q_cap.not_enough_liquidity && q_cap.amount == peak,
-                "{label}: {q_cap:?}"
-            );
-            assert!(
-                q_far.not_enough_liquidity && q_far.amount == peak,
-                "{label}: {q_far:?}"
-            );
-            assert_eq!(q_cap.expected_output, peak_net);
-            assert!(q_cap.price > 0.0 && q_cap.price.is_finite());
-            let q_past = fx.quote(0, 1, peak + 1).unwrap();
-            assert!(q_past.not_enough_liquidity && q_past.amount == peak);
-        }
-        let q_peak = fx.quote(0, 1, peak).unwrap();
-        assert!(!q_peak.not_enough_liquidity && q_peak.expected_output == peak_net);
-        let (lb, ub) = fx.venue.bounds(0, 1).unwrap();
-        assert!(
-            ub <= peak && peak - ub <= 100,
-            "{label}: ub {ub} vs peak {peak}"
-        );
-        // Price positive and non-increasing (1e-3 slack, as the shared suite)
-        // on a log grid of the domain.
-        let mut prev_price = f64::INFINITY;
-        for x in grid(lb, ub, 40) {
-            let p = fx.quote(0, 1, x).unwrap().price;
-            assert!(
-                p > 0.0 && p <= prev_price * 1.001,
-                "{label}: price at {x}: {p} after {prev_price}"
-            );
-            prev_price = p;
-        }
-        eprintln!(
-            "{label}: cap {cap}, net-output peak at {peak} ({:.1}% of the cap) = {peak_net}, net at cap {}, worst sawtooth below the peak {worst_dip_rel:.2e}, bounds [{lb}, {ub}]",
-            peak as f64 * 100.0 / cap as f64,
-            net(&fx, cap)
-        );
-        // The peak executes exactly on-chain (payout and pool account).
-        fx.check_swap(0, 1, peak);
     }
+}
+
+/// Cached curve and policy parameters must be rebuilt from every pool/clock
+/// update. Snapshot writes here isolate adapter refresh from management
+/// authorization; the local stand covers the actual RM/admin instructions.
+#[test]
+fn policy_refresh_tracks_virtual_balances_weights_admin_and_token_activity() {
+    let mut fx = Fixture::new(
+        3_000,
+        &[
+            TokenSpec::new(9, 5_000, 1_000_000_000_000, 1_000_000_000_000)
+                .cap(5_000)
+                .surge(5_000, 100, 1_000, 3_000, 75),
+            TokenSpec::new(9, 5_000, 1_000_000_000_000, 1_000_000_000_000),
+        ],
+    );
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(250_049_999_999));
+    fx.check_swap(0, 1, 100_000_000_000);
+    let limit_before_rm = fx.venue.fill_limit(0, 1);
+    let price_before_rm = fx.quote(0, 1, 1_000_000).unwrap().price;
+    fx.update_pool(|pool| {
+        pool.range_manager_enabled = true;
+        pool.tokens[0].dynamics.virtual_balance = 2_000_000_000_000;
+        pool.tokens[1].dynamics.virtual_balance = 2_000_000_000_000;
+        pool.tokens[0].config.normalized_weight = 6_000;
+        pool.tokens[1].config.normalized_weight = 4_000;
+    });
+    // The running window retains its pre-RM snapshot despite the new curve.
+    assert_eq!(fx.venue.fill_limit(0, 1), limit_before_rm);
+    assert_ne!(fx.quote(0, 1, 1_000_000).unwrap().price, price_before_rm);
+    fx.check_swap(0, 1, 1_000_000);
+    fx.update_pool(|pool| pool.tokens[0].config.variable_fee_threshold_pct = 2_000);
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(48_999_999));
+    fx.update_pool(|pool| pool.tokens[0].config.is_active = false);
+    assert!(fx.quote(0, 1, 1_000).is_err());
+    fx.check_swap(1, 0, 1_000_000); // input kill switch still permits buying it
+    fx.update_pool(|pool| pool.tokens[0].config.is_active = true);
+    fx.check_swap(0, 1, 1_000_000);
+    fx.update_pool(|pool| pool.tokens[0].config.variable_fee_slope_high_pct = 0);
+    assert_eq!(fx.venue.fill_limit(0, 1), None);
+    assert!(
+        !fx.quote(0, 1, 100_000_000_000)
+            .unwrap()
+            .not_enough_liquidity
+    );
+    fx.update_pool(|pool| {
+        pool.tokens[0].config.variable_fee_slope_high_pct = 3_000;
+        pool.tokens[0].config.max_selloff_pct = 0;
+    });
+    assert_eq!(fx.venue.fill_limit(0, 1), None);
+    fx.check_swap(0, 1, 100_000_000);
+    fx.update_pool(|pool| pool.tokens[0].config.max_selloff_pct = 5_000);
+    assert!(fx.venue.fill_limit(0, 1).is_some());
+    // A fresh window adopts the moved VB; no stale cap or weight cache.
+    let vb = fx.pool().tokens[0].dynamics.virtual_balance;
+    fx.set_clock(NOW + 2 * PERIOD as i64);
+    fx.refresh();
+    let cap = vb / 2;
+    let expected = ((cap as u128 * 2_001 - 1) / 10_000) as u64;
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(expected));
+    fx.check_swap(0, 1, expected);
+}
+
+/// A one-period rotation re-bases the zero-surge boundary to the moved VB
+/// and rescales the previous sell-off before applying its time decay.
+#[test]
+fn zero_surge_limit_uses_rescaled_carryover_after_range_update() {
+    let mut fx = Fixture::new(
+        0,
+        &[
+            TokenSpec::new(9, 5_000, 1_000_000_000_000, 1_000_000_000_000)
+                .cap(5_000)
+                .surge(5_000, 100, 1_000, 3_000, 75),
+            TokenSpec::new(9, 5_000, 1_000_000_000_000, 1_000_000_000_000),
+        ],
+    );
+    fx.check_swap(0, 1, 100_000_000_000);
+    fx.update_pool(|pool| pool.tokens[0].dynamics.virtual_balance = 2_000_000_000_000);
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(150_049_999_999));
+    let opened = NOW - 1_000;
+    fx.set_clock(opened + PERIOD as i64);
+    fx.refresh();
+    // cap=1e12, previous=2e11, zero-surge endpoint=500,099,999,999.
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(300_099_999_999));
+    fx.set_clock(opened + PERIOD as i64 + PERIOD as i64 / 2);
+    fx.refresh();
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(400_099_999_999));
+    fx.check_swap(0, 1, 400_099_999_999);
+    let dynamics = fx.pool().tokens[0].dynamics;
+    assert_eq!(dynamics.selloff_vb_snapshot, 2_000_000_000_000);
+    assert_eq!(dynamics.previous_selloff, 200_000_000_000);
+    assert_eq!(fx.venue.fill_limit(0, 1), Some(0));
 }

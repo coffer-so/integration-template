@@ -9,30 +9,35 @@
 //! implementation, the closed-form marginal price and the swap instruction.
 //!
 //! Quote semantics (see [`TradingVenue::quote`] for the contract):
-//! - every guard the on-chain handler runs is run here in the same order;
+//! - pool/token switches and frozen SPL vaults prevent quoting;
 //! - `amount == 0` returns zero output and the spot price;
 //! - a swap the sell-off window would reject (`MaxSelloffExceeded`) is
 //!   reported as a partial fill: `not_enough_liquidity = true`, `amount` = the
-//!   largest gross input the window still admits, `expected_output` = the
-//!   output at that size;
+//!   largest supported gross input, `expected_output` = the output at that size;
 //! - a swap whose curve output exceeds the LP-owned balance
 //!   (`AmountOutExceedsBalance`) is likewise a partial fill, sized by a binary
 //!   search over the exact quote;
 //! - `ZeroFeeAmount` (unreachable on `main`: the fee rounds UP) and config /
 //!   arithmetic failures are errors.
+//! - the surge-fee domain is limited to the exact zero-fee prefix. The
+//!   contract's segmented output can decrease outside it, which is incompatible
+//!   with Titan's required positive marginal price. Such requests are partial
+//!   fills, even when the on-chain program would accept the full amount.
 //!
 //! State freshness: nothing a quote reads survives `update_state`. The pool
 //! account (virtual/actual balances, weights, fee rates, kill switches, the
 //! sell-off caps and surge curves, the window accumulators and snapshot), the
-//! mints and the Clock sysvar are re-read on every refresh and the per-direction
+//! mints, vaults and Clock sysvar are re-read on every refresh and the per-direction
 //! curve parameters are rebuilt from them; the only thing fixed at creation is
 //! the token set, which the contract cannot change either. The pool's admin
 //! and range-manager roles may move virtual balances, weights, caps and curves
 //! at any time between two refreshes — see `directions_num` for why the
 //! declared directions do not depend on any of that.
 
+mod domain;
 pub mod instruction;
 pub mod price;
+mod vault;
 
 use async_trait::async_trait;
 use solana_account::Account;
@@ -51,7 +56,7 @@ use crate::{
     },
     coffer_venue::{
         instruction::{INITIALIZE_POOL_DISCRIMINATOR, SwapAccounts, swap_instruction},
-        price::{CurveParams, surge_rate},
+        price::CurveParams,
     },
     trading_venue::{
         AddressLookupTableTrait, FromAccount, QuoteRequest, QuoteResult, SwapType, TradingVenue,
@@ -113,13 +118,11 @@ pub fn parse_pool_creations(instructions: &[ParsedInstruction]) -> Vec<PoolCreat
 #[derive(Debug, Clone, Copy, Default)]
 struct DirectionParams {
     curve: Option<CurveParams>,
-    /// Upper end of the quotable domain when the input token's surge fee is
-    /// live: the input at which the user's NET output peaks. Beyond it the
-    /// contract's segmented surge charge grows faster than the curve output
-    /// (a larger input pays fewer atoms), so requests past it are partial
-    /// fills at the peak — Titan's `f` must be non-decreasing and `price`
-    /// positive on the reported domain. `None` when the direction has no
-    /// surge (net output = curve output, monotone by construction).
+    /// Largest admitted input within the proven zero-fee threshold prefix,
+    /// also limited by the available LP balance. The segmented surge curve
+    /// can have downward steps even before its maximum, so that whole regime
+    /// is excluded from Titan's differentiable quote interface. `None` means
+    /// surge is disabled; `Some(0)` means no positive fill is available.
     fill_limit: Option<u64>,
 }
 
@@ -144,9 +147,11 @@ pub struct CofferVenue {
     token_info: Vec<TokenInfo>,
     /// Mint decimals per slot.
     decimals: [u8; MAX_TOKENS],
+    /// Refreshed SPL / Token-2022 vault state, independent of `is_active`.
+    vault_frozen: [bool; MAX_TOKENS],
     /// `[in][out]` closed-form price parameters.
     directions: [[DirectionParams; MAX_TOKENS]; MAX_TOKENS],
-    /// Accounts `update_state` needs: pool, every mint, the clock sysvar.
+    /// Accounts `update_state` needs: pool, every mint, every vault, Clock.
     required_state_pubkeys: Vec<Pubkey>,
     initialized: bool,
 }
@@ -201,7 +206,7 @@ impl CofferVenue {
 
     /// Rebuild every per-direction parameter from the freshly decoded pool,
     /// clock and decimals (called last in `update_state`).
-    fn rebuild_directions(&mut self) {
+    fn rebuild_directions(&mut self) -> Result<(), TradingVenueError> {
         let n = self.pool.token_count as usize;
         for i in 0..n.min(MAX_TOKENS) {
             for j in 0..n.min(MAX_TOKENS) {
@@ -221,11 +226,10 @@ impl CofferVenue {
                 };
             }
         }
-        // The surge-limited directions: the input token has a live cap AND a
-        // surge curve, and the pool can trade. The search runs the exact
-        // quote ~150 times per such direction, once per refresh.
+        // Resolve the exact no-surge prefix once per input token from the
+        // same Clock/window snapshot used by the contract port.
         if !self.pool.pool_enabled || !self.pool.swaps_enabled {
-            return;
+            return Ok(());
         }
         for i in 0..n.min(MAX_TOKENS) {
             let cfg = &self.pool.tokens[i].config;
@@ -235,9 +239,11 @@ impl CofferVenue {
             let Ok(in_idx) = u8::try_from(i) else {
                 continue;
             };
-            let headroom = match selloff_headroom(&self.pool, in_idx, self.now) {
-                Ok(Some(h)) => h,
-                _ => continue,
+            let headroom = match domain::surge_free_headroom(&self.pool, in_idx, self.now)
+                .map_err(map_error)?
+            {
+                Some(h) => h,
+                None => continue,
             };
             for j in 0..n.min(MAX_TOKENS) {
                 let Ok(out_idx) = u8::try_from(j) else {
@@ -246,153 +252,34 @@ impl CofferVenue {
                 if i == j || self.directions[i][j].curve.is_none() {
                     continue;
                 }
-                // Window / LP-balance limit, then where the rate hits 100%
-                // (every further atom buys nothing: price would be 0), then
-                // the net-output peak.
-                let hi = self.largest_fillable(in_idx, out_idx, headroom);
-                let hi = self.surge_exhaustion_point(in_idx, hi);
-                self.directions[i][j].fill_limit = Some(self.net_output_peak(in_idx, out_idx, hi));
+                self.directions[i][j].fill_limit =
+                    Some(self.largest_fillable(in_idx, out_idx, headroom));
             }
         }
+        Ok(())
     }
 
-    /// Largest input `x <= hi` whose post-swap window position keeps the surge
-    /// rate below 100% (the rate is non-decreasing in the fill).
-    fn surge_exhaustion_point(&self, in_idx: u8, hi: u64) -> u64 {
-        let cfg = &self.pool.tokens[in_idx as usize].config;
-        let saturated = |x: u64| match self.selloff_after(in_idx, x) {
-            Ok(Some((effective, cap))) => surge_rate(cfg, effective, cap) >= 1.0,
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        if hi == 0 || !saturated(hi) {
-            return hi;
-        }
-        let (mut lo, mut hi) = (0u64, hi);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if saturated(mid) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        lo
-    }
-
-    /// The input `x <= hi` at which the user's net output (curve output minus
-    /// the surge fee) is largest.
-    ///
-    /// In the continuous model the net marginal rate `f'(x)·(1 - rate)` is
-    /// never negative, but the contract charges the surge on 4 segments of
-    /// the taxed span at each segment's average rate (quantised to 0.01%),
-    /// re-partitioned for every request size: past some point the charge
-    /// grows faster than the curve pays out, and a larger input receives
-    /// fewer atoms. The net function is unimodal up to a sawtooth of at most
-    /// ~1e-4 of the output (one rate quantum on a segment's output), so a
-    /// ternary search lands on the plateau around the maximum, and the limit
-    /// is the far end of that plateau (see below).
-    fn net_output_peak(&self, in_idx: u8, out_idx: u8, hi: u64) -> u64 {
-        let net = |x: u64| {
-            self.exact(in_idx, out_idx, x)
-                .map(|o| o.amount_out_user)
-                .unwrap_or(0)
-        };
-        let hi_limit = hi;
-        let (mut lo, mut hi) = (0u64, hi);
-        while hi - lo > 2 {
-            let third = (hi - lo) / 3;
-            let (m1, m2) = (lo + third, hi - third);
-            if net(m1) < net(m2) {
-                lo = m1;
-            } else {
-                hi = m2;
-            }
-        }
-        let mut best = (lo, net(lo));
-        for x in lo + 1..=hi {
-            let v = net(x);
-            if v > best.1 {
-                best = (x, v);
-            }
-        }
-        // The sawtooth makes the top a plateau, not a point: extend the limit
-        // to the largest input whose net output is within two rate quanta
-        // (2e-4) of the maximum, so a curve too mild to bend the net output
-        // keeps the whole window as its domain, while a real decline (0.3% at
-        // 95/5 with a 0 → 25% curve) still ends it at the peak.
-        let (peak, max_net) = best;
-        let tolerance = max_net / 5_000;
-        let within = |x: u64| net(x).saturating_add(tolerance) >= max_net;
-        if within(hi_limit) {
-            return hi_limit;
-        }
-        let (mut lo, mut hi) = (peak, hi_limit);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if within(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
-    }
-
-    /// Marginal user output per input atom at `amount_in` (see `price.rs`).
-    /// `effective_selloff` is the window position AFTER this swap, if capped.
+    /// Marginal output on the admitted, surge-free domain. For an exhausted
+    /// direction the zero-fill result carries the base spot price as a
+    /// sentinel; `not_enough_liquidity` and `bounds` mark it unavailable.
     fn marginal_price(
         &self,
         in_idx: u8,
         out_idx: u8,
         amount_in: u64,
-        selloff: Option<(u64, u64)>,
     ) -> Result<f64, TradingVenueError> {
         let curve = self.directions[in_idx as usize][out_idx as usize]
             .curve
             .ok_or(TradingVenueError::MathError(
                 "direction has no curve".into(),
             ))?;
-        let mut price = curve.marginal_output(amount_in);
-        if let Some((effective_selloff, cap)) = selloff {
-            let cfg = &self.pool.tokens[in_idx as usize].config;
-            price *= 1.0 - surge_rate(cfg, effective_selloff, cap);
-        }
-        if !price.is_finite() || price < 0.0 {
+        let price = curve.marginal_output(amount_in);
+        if !price.is_finite() || price <= 0.0 {
             return Err(TradingVenueError::MathError(
-                "non-finite marginal price".into(),
+                "non-positive or non-finite marginal price".into(),
             ));
         }
         Ok(price)
-    }
-
-    /// The window position/cap a quote of `amount_in` would land on, if the
-    /// input token is capped. `None` when uncapped.
-    fn selloff_after(
-        &self,
-        in_idx: u8,
-        amount_in: u64,
-    ) -> Result<Option<(u64, u64)>, TradingVenueError> {
-        let cfg = &self.pool.tokens[in_idx as usize].config;
-        if cfg.max_selloff_pct == 0 {
-            return Ok(None);
-        }
-        let mut dynamics = self.pool.tokens[in_idx as usize].dynamics;
-        let vb = dynamics.virtual_balance;
-        match crate::coffer::math::max_selloff::check_and_advance(
-            &mut dynamics,
-            cfg.max_selloff_pct as u64,
-            cfg.max_selloff_period_length,
-            amount_in,
-            vb,
-            self.now,
-        ) {
-            Ok(Some(r)) => Ok(Some((r.effective_selloff, r.max_selloff_cap))),
-            Ok(None) => Ok(None),
-            // Beyond the cap: the rate saturates at full fill.
-            Err(ErrorCode::MaxSelloffExceeded) => Ok(Some((u64::MAX, 1))),
-            Err(e) => Err(map_error(e)),
-        }
     }
 
     fn exact(&self, in_idx: u8, out_idx: u8, amount_in: u64) -> Result<SwapOutcome, ErrorCode> {
@@ -428,15 +315,14 @@ impl CofferVenue {
 
     /// The single place a fill is sized: the largest input `<= hi` the program
     /// accepts (window cap, LP balance, overflow), capped by the direction's
-    /// net-output peak. Every partial-fill path — beyond the window, beyond
-    /// the LP balance, beyond the peak — goes through here, so the reported
-    /// amount is the same whichever limit the request tripped first.
+    /// surge-free domain. Every partial-fill path — beyond the window, beyond
+    /// the LP balance, beyond the surge-free limit — goes through here, so the
+    /// reported amount is the same whichever limit the request tripped first.
     fn fillable(&self, in_idx: u8, out_idx: u8, hi: u64) -> u64 {
-        let amount = self.largest_fillable(in_idx, out_idx, hi);
-        match self.directions[in_idx as usize][out_idx as usize].fill_limit {
-            Some(limit) => amount.min(limit),
-            None => amount,
-        }
+        let hi = self.directions[in_idx as usize][out_idx as usize]
+            .fill_limit
+            .map_or(hi, |limit| hi.min(limit));
+        self.largest_fillable(in_idx, out_idx, hi)
     }
 
     /// A partial fill of at most `hi` gross input atoms (see `fillable`).
@@ -449,18 +335,12 @@ impl CofferVenue {
     ) -> Result<QuoteResult, TradingVenueError> {
         let amount = self.fillable(in_idx, out_idx, hi);
         let (expected_output, price) = if amount == 0 {
-            (
-                0,
-                self.marginal_price(in_idx, out_idx, 0, self.selloff_after(in_idx, 0)?)?,
-            )
+            (0, self.marginal_price(in_idx, out_idx, 0)?)
         } else {
             let o = self.exact(in_idx, out_idx, amount).map_err(map_error)?;
-            let selloff = o
-                .max_selloff_result
-                .map(|r| (r.effective_selloff, r.max_selloff_cap));
             (
                 o.amount_out_user,
-                self.marginal_price(in_idx, out_idx, amount, selloff)?,
+                self.marginal_price(in_idx, out_idx, amount)?,
             )
         };
         Ok(QuoteResult {
@@ -494,9 +374,14 @@ impl FromAccount for CofferVenue {
                 "coffer pool has an invalid token_count".into(),
             ));
         }
-        let mut required_state_pubkeys = Vec::with_capacity(pool.token_count as usize + 2);
+        let mut required_state_pubkeys = Vec::with_capacity(2 * pool.token_count as usize + 2);
         required_state_pubkeys.push(*pubkey);
         required_state_pubkeys.extend(pool.active_slots().iter().map(|s| s.config.mint));
+        required_state_pubkeys.extend(
+            pool.active_slots()
+                .iter()
+                .map(|s| CofferPool::derive_vault(pubkey, &s.config.mint, &s.config.token_program)),
+        );
         required_state_pubkeys.push(clock::ID);
         Ok(Self {
             pool_key: *pubkey,
@@ -505,6 +390,7 @@ impl FromAccount for CofferVenue {
             epoch: 0,
             token_info: Vec::new(),
             decimals: [0; MAX_TOKENS],
+            vault_frozen: [false; MAX_TOKENS],
             directions: [[DirectionParams::default(); MAX_TOKENS]; MAX_TOKENS],
             required_state_pubkeys,
             initialized: false,
@@ -591,6 +477,8 @@ impl TradingVenue for CofferVenue {
     }
 
     async fn update_state(&mut self, cache: &dyn AccountsCache) -> Result<(), TradingVenueError> {
+        // A failed refresh must not leave a previously tradable snapshot live.
+        self.initialized = false;
         let keys = self.required_state_pubkeys.clone();
         let accounts = cache.get_accounts(&keys).await?;
         if accounts.len() != keys.len() {
@@ -606,7 +494,10 @@ impl TradingVenue for CofferVenue {
                 .active_slots()
                 .iter()
                 .zip(self.pool.active_slots())
-                .any(|(a, b)| a.config.mint != b.config.mint)
+                .any(|(a, b)| {
+                    a.config.mint != b.config.mint
+                        || a.config.token_program != b.config.token_program
+                })
         {
             // The token set is fixed at creation; a change means this is not
             // the pool we were built from.
@@ -623,6 +514,7 @@ impl TradingVenue for CofferVenue {
 
         let mut token_info = Vec::with_capacity(pool.token_count as usize);
         let mut decimals = [0u8; MAX_TOKENS];
+        let mut vault_frozen = [false; MAX_TOKENS];
         for (i, slot) in pool.active_slots().iter().enumerate() {
             let mint_key = slot.config.mint;
             let mint_account = accounts[1 + i]
@@ -635,15 +527,30 @@ impl TradingVenue for CofferVenue {
             decimals[i] = u8::try_from(info.decimals)
                 .map_err(|_| TradingVenueError::DataConversionError(mint_key.into()))?;
             token_info.push(info);
+            let vault_index = 1 + pool.token_count as usize + i;
+            let vault_key = keys[vault_index];
+            let account = accounts[vault_index]
+                .as_ref()
+                .ok_or(TradingVenueError::NoAccountFound(vault_key.into()))?;
+            vault_frozen[i] = vault::is_frozen(
+                &vault_key,
+                account,
+                &slot.config.token_program,
+                &mint_key,
+                &self.pool_key,
+            )?;
         }
 
-        self.pool = pool;
-        self.now = clock.unix_timestamp;
-        self.epoch = clock.epoch;
-        self.token_info = token_info;
-        self.decimals = decimals;
-        self.rebuild_directions();
-        self.initialized = true;
+        let mut refreshed = self.clone();
+        refreshed.pool = pool;
+        refreshed.now = clock.unix_timestamp;
+        refreshed.epoch = clock.epoch;
+        refreshed.token_info = token_info;
+        refreshed.decimals = decimals;
+        refreshed.vault_frozen = vault_frozen;
+        refreshed.rebuild_directions()?;
+        refreshed.initialized = true;
+        *self = refreshed;
         Ok(())
     }
 
@@ -678,22 +585,26 @@ impl TradingVenue for CofferVenue {
                 ErrorCode::TokenInactive.name(),
             )));
         }
+        if self.vault_frozen[in_idx as usize] || self.vault_frozen[out_idx as usize] {
+            return Err(TradingVenueError::AmmMethodError(ErrorInfo::StaticStr(
+                "AccountFrozen",
+            )));
+        }
 
         if request.amount == 0 {
-            // Zero output at the spot price f'(0), with the surge rate at the
-            // window's current position folded in.
-            let selloff = self.selloff_after(in_idx, 0)?;
+            // Zero remains a valid sentinel even if no positive amount fits.
+            // No surge derivative is advertised for an unavailable direction.
             return Ok(QuoteResult {
                 input_mint: request.input_mint,
                 output_mint: request.output_mint,
                 amount: 0,
                 expected_output: 0,
                 not_enough_liquidity: false,
-                price: self.marginal_price(in_idx, out_idx, 0, selloff)?,
+                price: self.marginal_price(in_idx, out_idx, 0)?,
             });
         }
 
-        // Past the direction's net-output peak: a partial fill at the peak.
+        // Restrict every quote path to the same proven surge-free prefix.
         if self.directions[in_idx as usize][out_idx as usize]
             .fill_limit
             .is_some_and(|limit| request.amount > limit)
@@ -702,19 +613,14 @@ impl TradingVenue for CofferVenue {
         }
 
         match self.exact(in_idx, out_idx, request.amount) {
-            Ok(o) => {
-                let selloff = o
-                    .max_selloff_result
-                    .map(|r| (r.effective_selloff, r.max_selloff_cap));
-                Ok(QuoteResult {
-                    input_mint: request.input_mint,
-                    output_mint: request.output_mint,
-                    amount: request.amount,
-                    expected_output: o.amount_out_user,
-                    not_enough_liquidity: false,
-                    price: self.marginal_price(in_idx, out_idx, request.amount, selloff)?,
-                })
-            }
+            Ok(o) => Ok(QuoteResult {
+                input_mint: request.input_mint,
+                output_mint: request.output_mint,
+                amount: request.amount,
+                expected_output: o.amount_out_user,
+                not_enough_liquidity: false,
+                price: self.marginal_price(in_idx, out_idx, request.amount)?,
+            }),
             Err(ErrorCode::MaxSelloffExceeded) => {
                 let headroom = selloff_headroom(&self.pool, in_idx, self.now)
                     .map_err(map_error)?
@@ -768,8 +674,9 @@ impl TradingVenue for CofferVenue {
             token_program_in: cfg_in.token_program,
             token_program_out: cfg_out.token_program,
         };
-        // `minimum_amount_out = 0`, like the Raydium reference: Titan's router
-        // enforces slippage on the whole route, not per leg.
+        // `minimum_amount_out = 0`, like the Raydium reference. Production
+        // integration must enforce the user's minimum output on the whole
+        // route; the local router template does not implement that check.
         Ok(swap_instruction(
             COFFER_PROGRAM_ID,
             &accounts,

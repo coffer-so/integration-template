@@ -24,8 +24,11 @@ use solana_transaction_status_client_types::{
 use spl_token::state::Account as TokenAccount;
 
 use titan_integration_template::account_caching::rpc_cache::RpcClientCache;
+use titan_integration_template::coffer::errors::ErrorCode;
 use titan_integration_template::coffer::state::CofferPool;
-use titan_integration_template::coffer::swap::{apply_swap, quote_exact_in};
+use titan_integration_template::coffer::swap::{
+    SwapOutcome, apply_swap, quote_exact_in, selloff_headroom,
+};
 use titan_integration_template::coffer_venue::{COFFER_PROGRAM_ID, CofferVenue};
 use titan_integration_template::local_stand::*;
 use titan_integration_template::trading_venue::{
@@ -193,7 +196,77 @@ impl Stand {
         routed: bool,
     ) -> Parity {
         let request = self.request(venue, i, j, amount);
-        let quote = venue.quote(request.clone()).expect("quote");
+        let quote = venue.quote(request).expect("adapter quote");
+        self.execute_parity_swap(
+            venue,
+            (i, j),
+            amount,
+            routed,
+            ContractFill {
+                amount: quote.amount,
+                expected_output: quote.expected_output,
+                not_enough_liquidity: quote.not_enough_liquidity,
+            },
+        )
+        .await
+    }
+
+    /// Test the complete contract amount, including surge regimes that Titan
+    /// deliberately does not advertise. This validates the raw port and the
+    /// instruction/router execution, not Titan quote availability or price.
+    pub async fn contract_parity_swap(
+        &self,
+        venue: &CofferVenue,
+        i: u8,
+        j: u8,
+        amount: u64,
+        routed: bool,
+    ) -> Parity {
+        let outcome = self
+            .contract_quote(venue, i, j, amount)
+            .expect("contract quote");
+        self.execute_parity_swap(
+            venue,
+            (i, j),
+            amount,
+            routed,
+            ContractFill {
+                amount,
+                expected_output: outcome.amount_out_user,
+                not_enough_liquidity: false,
+            },
+        )
+        .await
+    }
+
+    pub fn contract_quote(
+        &self,
+        venue: &CofferVenue,
+        i: u8,
+        j: u8,
+        amount: u64,
+    ) -> Result<SwapOutcome, ErrorCode> {
+        quote_exact_in(
+            venue.pool(),
+            amount,
+            i,
+            j,
+            venue.get_token(i as usize).unwrap().decimals as u8,
+            venue.get_token(j as usize).unwrap().decimals as u8,
+            venue.now(),
+        )
+    }
+
+    async fn execute_parity_swap(
+        &self,
+        venue: &CofferVenue,
+        direction: (u8, u8),
+        amount: u64,
+        routed: bool,
+        quote: ContractFill,
+    ) -> Parity {
+        let (i, j) = direction;
+        let request = self.request(venue, i, j, amount);
         if quote.amount == 0 {
             // Nothing fillable in this direction right now (window exhausted
             // by the previous sample): nothing to execute or compare.
@@ -223,6 +296,10 @@ impl Stand {
             (outcome.amount_out_user, outcome.surge_fee_amount, predicted)
         };
         let (expected, surge_fee, predicted) = predict(venue.now());
+        assert_eq!(
+            quote.expected_output, expected,
+            "selected quote must match the exact port"
+        );
 
         let out_tp = venue.get_token(j as usize).unwrap().get_token_program();
         let before = self.token_balance(&request.output_mint, &out_tp).await;
@@ -337,6 +414,94 @@ pub fn headroom_of(venue: &CofferVenue, i: u8, j: u8) -> QuoteResult {
             swap_type: SwapType::ExactIn,
         })
         .expect("probe quote")
+}
+
+/// Amount/output without a marginal-price claim. Used only by explicit
+/// raw-contract tests; never passed to Titan as a venue quote.
+pub struct ContractFill {
+    pub amount: u64,
+    pub expected_output: u64,
+    pub not_enough_liquidity: bool,
+}
+
+/// Largest input the exact contract port accepts, independent of the
+/// adapter's conservative surge-free routing domain.
+pub fn contract_headroom_of(venue: &CofferVenue, i: u8, j: u8) -> ContractFill {
+    let quote = |amount| {
+        quote_exact_in(
+            venue.pool(),
+            amount,
+            i,
+            j,
+            venue.get_token(i as usize).unwrap().decimals as u8,
+            venue.get_token(j as usize).unwrap().decimals as u8,
+            venue.now(),
+        )
+    };
+    let mut hi = selloff_headroom(venue.pool(), i, venue.now())
+        .expect("window configuration")
+        .unwrap_or(u64::MAX / 8);
+    let amount = if hi == 0 || quote(hi).is_ok() {
+        hi
+    } else {
+        let mut lo = 0;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if quote(mid).is_ok() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    };
+    ContractFill {
+        amount,
+        expected_output: if amount == 0 {
+            0
+        } else {
+            quote(amount).unwrap().amount_out_user
+        },
+        not_enough_liquidity: amount < u64::MAX / 8,
+    }
+}
+
+/// Check the adapter policy separately from full-contract execution. Bounds
+/// and partial fills must agree with the cached limit after each mutation.
+pub fn assert_adapter_domain(venue: &CofferVenue, i: u8, j: u8) {
+    let Some(limit) = venue.fill_limit(i, j) else {
+        return;
+    };
+    let request = |amount| QuoteRequest {
+        input_mint: venue.get_token(i as usize).unwrap().pubkey,
+        output_mint: venue.get_token(j as usize).unwrap().pubkey,
+        amount,
+        swap_type: SwapType::ExactIn,
+    };
+    if limit == 0 {
+        let q = venue.quote(request(1)).unwrap();
+        assert!(q.not_enough_liquidity && q.amount == 0 && q.expected_output == 0);
+        assert!(venue.bounds(i, j).is_err());
+        return;
+    }
+    let q = venue.quote(request(limit)).unwrap();
+    assert!(!q.not_enough_liquidity && q.amount == limit);
+    assert!(q.price > 0.0 && q.price.is_finite());
+    let exact = quote_exact_in(
+        venue.pool(),
+        limit,
+        i,
+        j,
+        venue.get_token(i as usize).unwrap().decimals as u8,
+        venue.get_token(j as usize).unwrap().decimals as u8,
+        venue.now(),
+    )
+    .unwrap();
+    assert_eq!(exact.surge_fee_amount, 0);
+    assert_eq!(q.expected_output, exact.amount_out_user);
+    let beyond = venue.quote(request(limit + 1)).unwrap();
+    assert!(beyond.not_enough_liquidity && beyond.amount == limit);
+    assert_eq!(beyond.expected_output, q.expected_output);
 }
 
 pub const SUITE_TESTS: [&str; 8] = [

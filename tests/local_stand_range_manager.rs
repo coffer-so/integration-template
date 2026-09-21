@@ -3,10 +3,12 @@
 //! reconfiguring the sell-off policy, liquidity added / removed, and the
 //! clock advancing between a quote and its execution.
 //!
-//! Every scenario asserts exact parity between `quote()` (after
-//! `update_state`) and a REAL transaction on the validator (routed through
-//! the Titan router or the venue's own `swap`), including the post-swap pool
-//! account, and runs Titan's shared suite on the mutated pools. Dedicated
+//! Contract-focused scenarios compare the complete `quote_exact_in` result
+//! with REAL transactions and full post-swap pool state, including surge
+//! amounts that Titan no longer advertises. Each refresh separately checks
+//! the adapter's surge-free domain; supported directions also run adapter
+//! quote parity and Titan's shared suite. Routed contract tests validate the
+//! instruction path, not router selection of an unsupported surge amount. Dedicated
 //! `rm_*` pools of the stand are mutated; reset the stand
 //! (`scripts/local-stand/up.sh`) before re-running.
 //!
@@ -55,6 +57,16 @@ use titan_integration_template::trading_venue::TradingVenue;
 // ---------------------------------------------------------------------------
 
 impl Stand {
+    /// Refresh and validate the adapter boundary independently of the raw
+    /// contract scenarios below.
+    async fn checked_venue(&self, pool: Pubkey) -> CofferVenue {
+        let venue = self.venue(pool).await;
+        for (i, j) in venue.directions_num() {
+            assert_adapter_domain(&venue, i, j);
+        }
+        venue
+    }
+
     /// The `(mint, token_program)` list of a pool, in slot order.
     fn pool_mints(&self, case: &str) -> Vec<(Pubkey, Pubkey)> {
         self.pool(case)
@@ -122,7 +134,7 @@ impl Stand {
     /// Block until the validator clock is at least `t`.
     async fn wait_until(&self, pool: Pubkey, t: i64) {
         loop {
-            let now = self.venue(pool).await.now();
+            let now = self.checked_venue(pool).await.now();
             if now >= t {
                 return;
             }
@@ -130,7 +142,8 @@ impl Stand {
         }
     }
 
-    /// Quote at the venue's clock, then execute the SAME instruction without
+    /// Predict the full contract amount at the venue's clock, then execute
+    /// the SAME instruction without
     /// any refresh once the clock passed `execute_at`. Returns
     /// `(quoted, received-or-error, block time - quote clock, exact at block time)`.
     async fn stale_execute(
@@ -140,11 +153,9 @@ impl Stand {
         execute_at: i64,
     ) -> (u64, Result<u64, u32>, i64, bool) {
         let request = self.request(venue, 0, 1, amount);
-        let quote = venue.quote(request.clone()).expect("quote");
-        assert!(
-            !quote.not_enough_liquidity && quote.amount == amount,
-            "{quote:?}"
-        );
+        let quote = self
+            .contract_quote(venue, 0, 1, amount)
+            .expect("raw contract quote");
         let ix = venue
             .generate_swap_instruction(request.clone(), self.wallet.pubkey())
             .unwrap();
@@ -190,7 +201,7 @@ impl Stand {
             }
         };
         (
-            quote.expected_output,
+            quote.amount_out_user,
             sent.map(|_| received),
             block_time - venue.now(),
             exact_at_block_time,
@@ -220,17 +231,26 @@ fn rescaled(value: u64, ratio: u128, increase: bool) -> u64 {
 async fn both_directions(stand: &Stand, pool: Pubkey, label: &str) -> Vec<Parity> {
     let mut rows = Vec::new();
     for (i, j, routed) in [(0u8, 1u8, false), (1, 0, true), (0, 1, true), (1, 0, false)] {
-        let venue = stand.venue(pool).await;
-        let (lb, ub) = venue.bounds(i, j).unwrap();
-        // Keep each BONK sell to a fraction of the window so the sequence
-        // never exhausts it: the geometric middle of the range.
-        let amount = geometric(lb, ub, 3)[1];
+        let venue = stand.checked_venue(pool).await;
+        let contract_head = contract_headroom_of(&venue, i, j).amount;
+        assert!(contract_head > 0, "{label}: no contract headroom");
+        // Exercise full contract fees independently of adapter availability.
+        let amount = geometric(1, contract_head, 3)[1];
         let spot = venue.quote(stand.request(&venue, i, j, 0)).unwrap();
         assert!(
             spot.price > 0.0 && spot.expected_output == 0,
             "{label}: {spot:?}"
         );
-        let p = stand.parity_swap(&venue, i, j, amount, routed).await;
+        let p = if let Ok((lb, ub)) = venue.bounds(i, j) {
+            // Retain adapter-to-execution coverage on each supported domain.
+            stand
+                .parity_swap(&venue, i, j, amount.clamp(lb, ub), routed)
+                .await
+        } else {
+            stand
+                .contract_parity_swap(&venue, i, j, amount, routed)
+                .await
+        };
         assert!(p.ok(), "{label}: {i}->{j} routed={routed} {p:?}");
         rows.push(p);
     }
@@ -241,7 +261,7 @@ async fn both_directions(stand: &Stand, pool: Pubkey, label: &str) -> Vec<Parity
 /// `mean_value_theorem` on the USDC -> BONK direction (documented residual
 /// of the input-side fee rounding, unrelated to the mutation).
 async fn suite_after(pool: Pubkey, label: &str) -> String {
-    let rows = run_full_suite(pool, false).await;
+    let rows = run_full_suite(pool, true).await;
     let mut failed = Vec::new();
     for (t, r) in &rows {
         if let Err(msg) = r {
@@ -283,30 +303,33 @@ async fn range_manager_vb_moves_and_rotation() {
     println!("\n== range manager: vb moves on a half-filled {period} s window (rm_short) ==");
 
     // Fresh window: two periods since the pool was created.
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let opened = venue.pool().tokens[0].dynamics.window_start_timestamp;
     stand.wait_until(pool, opened + 2 * period + 1).await;
 
     // Half-fill the window. This opens the window (snapshot := live vb).
-    let venue = stand.venue(pool).await;
-    let cap = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let cap = contract_headroom_of(&venue, 0, 1).amount;
     let vb0 = venue.pool().tokens[0].dynamics.virtual_balance;
     assert_eq!(cap, vb0 / 10);
-    let p = stand.parity_swap(&venue, 0, 1, cap / 2, false).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, cap / 2, false)
+        .await;
     assert!(p.ok(), "{p:?}");
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let d = venue.pool().tokens[0].dynamics;
     let window_start = d.window_start_timestamp;
     let snapshot = d.selloff_vb_snapshot;
     assert_eq!(snapshot, vb0);
     assert_eq!(d.current_selloff, cap / 2);
-    let head0 = headroom_of(&venue, 0, 1).amount;
+    let head0 = contract_headroom_of(&venue, 0, 1).amount;
     assert_eq!(head0, cap - cap / 2);
-    let q0 = venue.quote(stand.request(&venue, 0, 1, head0 / 2)).unwrap();
+    let q0 = stand.contract_quote(&venue, 0, 1, head0 / 2).unwrap();
+    let spot0 = venue.quote(stand.request(&venue, 0, 1, 0)).unwrap().price;
     println!(
         "  half-filled: snapshot {snapshot}, cap {cap}, headroom {head0}, quote({}) = {} (surge fee in it)",
         head0 / 2,
-        q0.expected_output
+        q0.amount_out_user
     );
 
     // (a) raise BONK vb by the max step (+50%): the cap stays on the old
@@ -314,7 +337,7 @@ async fn range_manager_vb_moves_and_rotation() {
     let live_vb = venue.pool().tokens[0].dynamics.virtual_balance;
     let raised = live_vb + live_vb / 2;
     stand.range_update(pool, &[(0, raised)], &[]).await;
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     assert_eq!(venue.pool().tokens[0].dynamics.virtual_balance, raised);
     assert_eq!(
         venue.pool().tokens[0].dynamics.selloff_vb_snapshot,
@@ -322,79 +345,89 @@ async fn range_manager_vb_moves_and_rotation() {
         "snapshot untouched"
     );
     assert_eq!(
-        headroom_of(&venue, 0, 1).amount,
+        contract_headroom_of(&venue, 0, 1).amount,
         head0,
         "headroom on the OLD snapshot"
     );
-    let q1 = venue.quote(stand.request(&venue, 0, 1, head0 / 2)).unwrap();
+    let q1 = stand.contract_quote(&venue, 0, 1, head0 / 2).unwrap();
+    let spot1 = venue.quote(stand.request(&venue, 0, 1, 0)).unwrap().price;
     assert!(
-        q1.expected_output < q0.expected_output,
+        q1.amount_out_user < q0.amount_out_user,
         "a larger vb_in pays less: {q1:?} vs {q0:?}"
     );
-    assert!(q1.price < q0.price);
-    let p = stand.parity_swap(&venue, 0, 1, head0 / 4, false).await;
+    assert!(
+        spot1 < spot0,
+        "base spot must follow the virtual balance move"
+    );
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head0 / 4, false)
+        .await;
     assert!(p.ok(), "after +50% vb: {p:?}");
     println!(
         "  +50% vb -> {raised}: snapshot {snapshot} kept, headroom {head0} kept, quote({}) = {} (was {}), sold {} exact (surge {})",
         head0 / 2,
-        q1.expected_output,
-        q0.expected_output,
+        q1.amount_out_user,
+        q0.amount_out_user,
         p.amount_executed,
         p.surge_fee
     );
 
     // lower it by 40%
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let live_vb = venue.pool().tokens[0].dynamics.virtual_balance;
     let lowered = live_vb - live_vb * 40 / 100;
     stand.range_update(pool, &[(0, lowered)], &[]).await;
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     assert_eq!(
         venue.pool().tokens[0].dynamics.selloff_vb_snapshot,
         snapshot
     );
-    let head2 = headroom_of(&venue, 0, 1).amount;
+    let head2 = contract_headroom_of(&venue, 0, 1).amount;
     assert_eq!(
         head2,
         head0 - head0 / 4,
         "headroom only moved by what was sold"
     );
-    let q2 = venue.quote(stand.request(&venue, 0, 1, head0 / 4)).unwrap();
-    let p = stand.parity_swap(&venue, 0, 1, head0 / 4, true).await;
+    let q2 = stand.contract_quote(&venue, 0, 1, head0 / 4).unwrap();
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head0 / 4, true)
+        .await;
     assert!(p.ok(), "after -40% vb (routed): {p:?}");
     println!(
         "  -40% vb -> {lowered}: snapshot kept, headroom {head2}, quote({}) = {}, routed sell exact (surge {})",
         head0 / 4,
-        q2.expected_output,
+        q2.amount_out_user,
         p.surge_fee
     );
 
     // (c) vb and weights in ONE update: +20% BONK vb, 50/50 -> 55/45.
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let live_vb = venue.pool().tokens[0].dynamics.virtual_balance;
     let both = live_vb + live_vb / 5;
     stand
         .range_update(pool, &[(0, both)], &[(0, 5_500), (1, 4_500)])
         .await;
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     assert_eq!(venue.pool().tokens[0].config.normalized_weight, 5_500);
     assert_eq!(venue.pool().tokens[1].config.normalized_weight, 4_500);
     assert_eq!(
         venue.pool().tokens[0].dynamics.selloff_vb_snapshot,
         snapshot
     );
-    let head3 = headroom_of(&venue, 0, 1).amount;
-    let p = stand.parity_swap(&venue, 0, 1, head3 / 2, false).await;
+    let head3 = contract_headroom_of(&venue, 0, 1).amount;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head3 / 2, false)
+        .await;
     assert!(p.ok(), "after vb+weights: {p:?}");
     let pb = stand
-        .parity_swap(&stand.venue(pool).await, 1, 0, 1_000_000_000, true)
+        .parity_swap(&stand.checked_venue(pool).await, 1, 0, 1_000_000_000, true)
         .await;
     assert!(pb.ok(), "buy side after vb+weights: {pb:?}");
     println!(
         "  +20% vb and 55/45 weights in one update: headroom {head3}, sold {} exact (surge {}), bought BONK with 1000 USDC exact",
         p.amount_executed, p.surge_fee
     );
-    let elapsed_in_window = stand.venue(pool).await.now() - window_start;
+    let elapsed_in_window = stand.checked_venue(pool).await.now() - window_start;
     assert!(
         elapsed_in_window < period,
         "the scenario must fit in one window ({elapsed_in_window} s)"
@@ -402,10 +435,10 @@ async fn range_manager_vb_moves_and_rotation() {
 
     // Rotation: the new snapshot is the MOVED vb, the carry-over is rescaled.
     stand.wait_until(pool, window_start + period + 2).await;
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let pre = *venue.pool();
     let live_vb = pre.tokens[0].dynamics.virtual_balance;
-    let head4 = headroom_of(&venue, 0, 1).amount;
+    let head4 = contract_headroom_of(&venue, 0, 1).amount;
     let expected_prev = (pre.tokens[0].dynamics.current_selloff as u128 * live_vb as u128
         / snapshot as u128) as u64;
     let expected_cap = live_vb / 10;
@@ -416,7 +449,9 @@ async fn range_manager_vb_moves_and_rotation() {
         expected_cap - expected_effective,
         "rotation: new cap on the moved vb, carry-over rescaled"
     );
-    let p = stand.parity_swap(&venue, 0, 1, head4 / 2, false).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head4 / 2, false)
+        .await;
     assert!(p.ok(), "post-rotation sell: {p:?}");
     let chain = stand.pool_state(pool).await;
     assert_eq!(
@@ -437,9 +472,9 @@ async fn range_manager_vb_moves_and_rotation() {
     // 1. Nothing moved the vb below the snapshot: execution pays MORE than
     //    quoted (the accumulated sells decay into the carry-over and the new
     //    snapshot is the grown vb).
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let ws = venue.pool().tokens[0].dynamics.window_start_timestamp;
-    let amount = headroom_of(&venue, 0, 1).amount / 2;
+    let amount = contract_headroom_of(&venue, 0, 1).amount / 2;
     let (quoted, got, dt, exact_bt) = stand.stale_execute(&venue, amount, ws + period + 2).await;
     let got1 = got.expect("stale execution after a plain rotation must not revert");
     assert!(
@@ -457,14 +492,14 @@ async fn range_manager_vb_moves_and_rotation() {
     //    snapshot at quote time); the rotation re-snapshots to the lowered vb,
     //    so the same input lands at a higher window fill: a higher surge rate
     //    (less output than quoted) or `MaxSelloffExceeded`.
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let ws = venue.pool().tokens[0].dynamics.window_start_timestamp;
     let live_vb = venue.pool().tokens[0].dynamics.virtual_balance;
     stand
         .range_update(pool, &[(0, live_vb - live_vb * 49 / 100)], &[])
         .await;
-    let venue = stand.venue(pool).await;
-    let amount = headroom_of(&venue, 0, 1).amount / 2;
+    let venue = stand.checked_venue(pool).await;
+    let amount = contract_headroom_of(&venue, 0, 1).amount / 2;
     let (quoted, got, dt, exact_bt) = stand.stale_execute(&venue, amount, ws + period + 2).await;
     match got {
         Ok(received) => {
@@ -494,7 +529,7 @@ async fn range_manager_vb_moves_and_rotation() {
         "monotone",
         "price_monotone",
     ] {
-        run_suite_test(t, pool, false)
+        run_suite_test(t, pool, true)
             .await
             .unwrap_or_else(|m| panic!("{t}: {m}"));
     }
@@ -519,15 +554,17 @@ async fn range_manager_weight_moves() {
         stand.appoint_range_manager(pool, 5_000, 3_000).await;
         // Put the surge pool inside the surge zone first (config b taxes from
         // fill 0, kink at 50%): sell 30% of the window.
-        let venue = stand.venue(pool).await;
-        let cap = headroom_of(&venue, 0, 1).amount;
-        let p = stand.parity_swap(&venue, 0, 1, cap * 3 / 10, false).await;
+        let venue = stand.checked_venue(pool).await;
+        let cap = contract_headroom_of(&venue, 0, 1).amount;
+        let p = stand
+            .contract_parity_swap(&venue, 0, 1, cap * 3 / 10, false)
+            .await;
         assert!(p.ok(), "{case}: {p:?}");
         for (w0, w1) in [(5_500u64, 4_500u64), (4_500, 5_500), (5_000, 5_000)] {
-            let before = stand.venue(pool).await;
+            let before = stand.checked_venue(pool).await;
             let spot_before = before.quote(stand.request(&before, 0, 1, 0)).unwrap().price;
             stand.range_update(pool, &[], &[(0, w0), (1, w1)]).await;
-            let venue = stand.venue(pool).await;
+            let venue = stand.checked_venue(pool).await;
             assert_eq!(venue.pool().tokens[0].config.normalized_weight, w0);
             assert_eq!(venue.pool().tokens[1].config.normalized_weight, w1);
             let spot_after = venue.quote(stand.request(&venue, 0, 1, 0)).unwrap().price;
@@ -537,17 +574,14 @@ async fn range_manager_weight_moves() {
                 / d.tokens[0].dynamics.virtual_balance as f64
                 * (w0 as f64 / w1 as f64)
                 * (1.0 - d.swap_fee_rate as f64 / 1_000_000.0);
-            let surge =
-                1.0 - venue.quote(stand.request(&venue, 0, 1, 0)).unwrap().price / expected_spot;
             assert!(
-                (-1e-9..1.0).contains(&surge),
-                "{case}: spot {spot_after} vs curve spot {expected_spot}"
+                (spot_after / expected_spot - 1.0).abs() < 1e-12,
+                "{case}: base spot {spot_after} vs curve spot {expected_spot}"
             );
             let rows = both_directions(&stand, pool, &format!("{case} {w0}/{w1}")).await;
             let suite = suite_after(pool, &format!("{case} {w0}/{w1}")).await;
             println!(
-                "  {case:<10} {w0}/{w1}: spot {spot_before:.6e} -> {spot_after:.6e} (curve {expected_spot:.6e}, surge factor {:.4}); 4 swaps exact: {}; {suite}",
-                1.0 - surge,
+                "  {case:<10} {w0}/{w1}: spot {spot_before:.6e} -> {spot_after:.6e} (base curve {expected_spot:.6e}); 4 swaps exact: {}; {suite}",
                 rows.iter()
                     .map(|p| format!(
                         "in {} out {} surge {}",
@@ -576,8 +610,8 @@ async fn range_manager_leverage_caps_output() {
     let dec = |v: &CofferVenue, i: usize| v.get_token(i).unwrap().decimals as u8;
 
     // Baseline: the window cap binds first.
-    let venue = stand.venue(pool).await;
-    let cap = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let cap = contract_headroom_of(&venue, 0, 1).amount;
     assert_eq!(cap, venue.pool().tokens[0].dynamics.virtual_balance / 10);
     assert_eq!(
         quote_exact_in(
@@ -593,7 +627,9 @@ async fn range_manager_leverage_caps_output() {
         ErrorCode::MaxSelloffExceeded
     );
     // Sell 45% of the window so the surge zone (threshold 50%) is next.
-    let p = stand.parity_swap(&venue, 0, 1, cap * 45 / 100, false).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, cap * 45 / 100, false)
+        .await;
     assert!(p.ok(), "{p:?}");
 
     // Push USDC vb to 16x in four max-step (100%) updates.
@@ -603,8 +639,8 @@ async fn range_manager_leverage_caps_output() {
             .virtual_balance;
         stand.range_update(pool, &[(1, live * 2)], &[]).await;
     }
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let window_head = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
@@ -625,26 +661,16 @@ async fn range_manager_leverage_caps_output() {
         .unwrap_err(),
         ErrorCode::AmountOutExceedsBalance
     );
-    let q = venue.quote(stand.request(&venue, 0, 1, head)).unwrap();
-    assert!(!q.not_enough_liquidity && q.price > 0.0 && q.price.is_finite());
+    let q = stand.contract_quote(&venue, 0, 1, head).unwrap();
     assert_eq!(
-        q.expected_output
-            + quote_exact_in(
-                venue.pool(),
-                head,
-                0,
-                1,
-                dec(&venue, 0),
-                dec(&venue, 1),
-                venue.now()
-            )
-            .unwrap()
-            .surge_fee_amount,
+        q.amount_out_user + q.surge_fee_amount,
         venue.pool().tokens[1].dynamics.actual_balance,
         "the edge drains the LP balance exactly (gross curve output)"
     );
+    let adapter_head = headroom_of(&venue, 0, 1).amount;
     let (_, ub) = venue.bounds(0, 1).unwrap();
-    assert!(ub <= head && head - ub <= 100);
+    assert!(ub <= adapter_head && adapter_head - ub <= 100);
+    assert!(adapter_head <= head);
     let ix = venue
         .generate_swap_instruction(stand.request(&venue, 0, 1, head + 1), stand.wallet.pubkey())
         .unwrap();
@@ -652,8 +678,10 @@ async fn range_manager_leverage_caps_output() {
         stand.send(&[ix]).await,
         Err(ErrorCode::AmountOutExceedsBalance.code())
     );
-    let venue = stand.venue(pool).await;
-    let p = stand.parity_swap(&venue, 0, 1, head / 3, true).await;
+    let venue = stand.checked_venue(pool).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 3, true)
+        .await;
     assert!(p.ok() && p.surge_fee > 0, "{p:?}");
     println!(
         "  USDC vb x16: fillable {head} < window headroom {window_head} (LP balance {} caps first), +1 atom reverts AmountOutExceedsBalance, bounds ub {ub}, routed sell of {} exact (surge {})",
@@ -669,8 +697,8 @@ async fn range_manager_leverage_caps_output() {
             .virtual_balance;
         stand.range_update(pool, &[(1, live / 2)], &[]).await;
     }
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let window_head = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
@@ -682,8 +710,10 @@ async fn range_manager_leverage_caps_output() {
         stand.send(&[ix]).await,
         Err(ErrorCode::MaxSelloffExceeded.code())
     );
-    let venue = stand.venue(pool).await;
-    let p = stand.parity_swap(&venue, 0, 1, head / 2, false).await;
+    let venue = stand.checked_venue(pool).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 2, false)
+        .await;
     assert!(p.ok() && p.surge_fee > 0, "{p:?}");
     let suite = suite_after(pool, case).await;
     println!(
@@ -709,9 +739,11 @@ async fn admin_reconfigures_max_selloff() {
     let reconfigure = |p: SelloffParams| set_max_selloff_ix(pool, me, &[p, SelloffParams::OFF]);
 
     // Half-fill the window.
-    let venue = stand.venue(pool).await;
-    let cap = headroom_of(&venue, 0, 1).amount;
-    let p = stand.parity_swap(&venue, 0, 1, cap / 2, false).await;
+    let venue = stand.checked_venue(pool).await;
+    let cap = contract_headroom_of(&venue, 0, 1).amount;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, cap / 2, false)
+        .await;
     assert!(p.ok(), "{p:?}");
     let snapshot = stand.pool_state(pool).await.tokens[0]
         .dynamics
@@ -725,24 +757,21 @@ async fn admin_reconfigures_max_selloff() {
         })])
         .await
         .unwrap();
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     assert_eq!(
         venue.pool().tokens[0].dynamics.selloff_vb_snapshot,
         snapshot
     );
-    let head = headroom_of(&venue, 0, 1).amount;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     let fill = effective_before(venue.pool(), venue.now());
     assert_eq!(raw, snapshot * 2 / 10 - fill);
-    // Config b reaches a 100% rate at full fill: the last atom buys nothing
-    // and the fillable amount stops one short of the raw headroom.
-    assert!(
-        head <= raw && raw - head <= 1,
-        "fillable {head} vs raw {raw}"
-    );
-    let p = stand.parity_swap(&venue, 0, 1, head / 4, true).await;
+    assert_eq!(head, raw, "contract fillable amount reaches the window cap");
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 4, true)
+        .await;
     assert!(p.ok(), "cap 20%: {p:?}");
     println!(
         "  cap 10% -> 20%: snapshot {snapshot} kept, raw headroom {raw} (fillable {head}), routed sell {} exact (surge {})",
@@ -757,7 +786,7 @@ async fn admin_reconfigures_max_selloff() {
         })])
         .await
         .unwrap();
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let q = venue.quote(stand.request(&venue, 0, 1, 1)).unwrap();
     assert!(
         q.not_enough_liquidity && q.amount == 0 && q.expected_output == 0,
@@ -780,8 +809,8 @@ async fn admin_reconfigures_max_selloff() {
     // Curve changed: cap 10%, threshold 80%, 0/0/100% (config c).
     let c = SelloffParams::new(1_000, b.period_length, 8_000, 0, 0, 10_000, 0);
     stand.send(&[reconfigure(c)]).await.unwrap();
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     // The window is at 87.5% of the 10% cap (50% + 37.5% sold above), i.e.
     // already past the new 80% threshold: even a small sell is surcharged,
     // at the rate of the new curve.
@@ -792,7 +821,9 @@ async fn admin_reconfigures_max_selloff() {
         small.surge_fee_amount > 0,
         "past the threshold: surge on every atom"
     );
-    let p = stand.parity_swap(&venue, 0, 1, head * 9 / 10, true).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head * 9 / 10, true)
+        .await;
     assert!(p.ok() && p.surge_fee > 0, "curve c: {p:?}");
     println!(
         "  curve -> thr 80% 0/0/100%: window at {fill_pct}% fill, headroom {head}, quote({}) already surcharged {}, routed sell {} exact with surge {}",
@@ -807,7 +838,7 @@ async fn admin_reconfigures_max_selloff() {
         .send(&[reconfigure(SelloffParams::OFF)])
         .await
         .unwrap();
-    let venue = stand.venue(pool).await;
+    let venue = stand.checked_venue(pool).await;
     let d_before = venue.pool().tokens[0].dynamics;
     let q = venue.quote(stand.request(&venue, 0, 1, cap * 2)).unwrap();
     assert!(!q.not_enough_liquidity, "uncapped: {q:?}");
@@ -833,8 +864,8 @@ async fn admin_reconfigures_max_selloff() {
 
     // Re-enabled (config b): the retained accumulators count against the new cap.
     stand.send(&[reconfigure(b)]).await.unwrap();
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
@@ -843,7 +874,9 @@ async fn admin_reconfigures_max_selloff() {
         snapshot / 10 - effective_before(venue.pool(), venue.now())
     );
     assert!(head <= raw && head > 0);
-    let p = stand.parity_swap(&venue, 0, 1, head / 2, true).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 2, true)
+        .await;
     assert!(p.ok(), "re-enabled: {p:?}");
     let suite = suite_after(pool, case).await;
     println!(
@@ -868,9 +901,11 @@ async fn admin_adds_and_removes_liquidity() {
     println!("\n== admin: add / remove liquidity between quotes (rm_liq, config b) ==");
 
     // 40% of the window sold.
-    let venue = stand.venue(pool).await;
-    let cap = headroom_of(&venue, 0, 1).amount;
-    let p = stand.parity_swap(&venue, 0, 1, cap * 4 / 10, false).await;
+    let venue = stand.checked_venue(pool).await;
+    let cap = contract_headroom_of(&venue, 0, 1).amount;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, cap * 4 / 10, false)
+        .await;
     assert!(p.ok(), "{p:?}");
 
     // Proportional deposit of 25%: vb, snapshot and accumulators scale by 1.25.
@@ -904,15 +939,17 @@ async fn admin_adds_and_removes_liquidity() {
         after.tokens[0].dynamics.current_selloff,
         rescaled(d0.current_selloff, ratio, true)
     );
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
     let expected_raw = after.tokens[0].dynamics.selloff_vb_snapshot / 10
         - effective_before(venue.pool(), venue.now());
     assert_eq!(raw, expected_raw);
-    let p = stand.parity_swap(&venue, 0, 1, head / 4, false).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 4, false)
+        .await;
     assert!(p.ok(), "after add_liquidity: {p:?}");
     println!(
         "  add_liquidity 25%: snapshot {} -> {}, current {} -> {}, headroom {} (raw {raw}), sold {} exact (surge {})",
@@ -957,8 +994,8 @@ async fn admin_adds_and_removes_liquidity() {
         after.tokens[0].dynamics.current_selloff,
         rescaled(d0.current_selloff, ratio, false)
     );
-    let venue = stand.venue(pool).await;
-    let head = headroom_of(&venue, 0, 1).amount;
+    let venue = stand.checked_venue(pool).await;
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     let raw = selloff_headroom(venue.pool(), 0, venue.now())
         .unwrap()
         .unwrap();
@@ -967,10 +1004,12 @@ async fn admin_adds_and_removes_liquidity() {
         after.tokens[0].dynamics.selloff_vb_snapshot / 10
             - effective_before(venue.pool(), venue.now())
     );
-    let p = stand.parity_swap(&venue, 0, 1, head / 3, true).await;
+    let p = stand
+        .contract_parity_swap(&venue, 0, 1, head / 3, true)
+        .await;
     assert!(p.ok(), "after remove_liquidity: {p:?}");
     let pb = stand
-        .parity_swap(&stand.venue(pool).await, 1, 0, 2_000_000_000, true)
+        .parity_swap(&stand.checked_venue(pool).await, 1, 0, 2_000_000_000, true)
         .await;
     assert!(pb.ok(), "{pb:?}");
     let suite = suite_after(pool, case).await;

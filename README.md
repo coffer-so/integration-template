@@ -163,22 +163,53 @@ contract source through a deterministic rename map
 | Layer | Where |
 | --- | --- |
 | Verbatim math port | `src/coffer/{constants,math/*}.rs` are byte-for-byte copies of the contract modules (only `use` lines differ); `src/coffer/swap.rs` embeds the swap handler's guard / fee / curve / surge-fee / payout / state-update segments verbatim; `src/coffer/{state,errors,prelude}.rs` mirror the Anchor-only pieces. `tests/coffer_source_parity.rs` diffs all of it against the contract source and fails on drift. Regenerate with `python3 scripts/port_coffer_math.py [<Coffer src dir>]`. The `coffer` module is `#[rustfmt::skip]` for that reason. |
-| Quote layer | `src/coffer_venue/mod.rs` — `CofferVenue` (`PoolProtocol::Coffer`, displayed as `"Coffer"`), `parse_pool_creations`, `update_state` (pool + mints + Clock sysvar), `directions_num`, `quote`, `generate_swap_instruction`, `AddressLookupTableTrait`. `price.rs` is the closed-form marginal price; `instruction.rs` the `swap` builder. |
+| Quote layer | `src/coffer_venue/mod.rs` — `CofferVenue` (`PoolProtocol::Coffer`, displayed as `"Coffer"`), `parse_pool_creations`, `update_state` (pool + mints + vaults + Clock sysvar), `directions_num`, `quote`, `generate_swap_instruction`, `AddressLookupTableTrait`. `price.rs` is the closed-form marginal price; `instruction.rs` the `swap` builder. |
 | Route builder | `Venue::Coffer { token_in_index, token_out_index }` in `src/swap_route/mod.rs`. |
 | Program layer | `program-template/.../venues/coffer.rs` CPI adapter, dispatch in `swap_route_v3.rs`, parity cases in `tests/venue_parity.rs`, route simulation in `tests/your_venue_route.rs`. |
 | Production bytecode | `programs/8iQtGj9mcUfFUGaiCpPy89swC3s8YTC8FhVZWfgeZhwu.so` (sha256 `5128c578…`, committed, pinned by the fixture suite) so the offline fixtures run the exact mainnet build. |
 
-Quote semantics: every on-chain guard runs first; `amount == 0` returns zero
-output and the spot price; a swap the sell-off window would reject
-(`MaxSelloffExceeded`) or whose curve output exceeds the LP-owned balance
-(`AmountOutExceedsBalance`) is a **partial fill** (`not_enough_liquidity =
-true`, `amount` = the largest input the program accepts, `expected_output` at
-that size); `ZeroFeeAmount` and arithmetic failures are errors; the handler's
-post-swap balance updates are re-run as overflow checks so the quote fails on
-exactly the inputs the program rejects. `minimum_amount_out` is 0 (the router
-enforces slippage on the route). `price = d(user_output)/d(amount_in)`, the
-derivative of the continuous curve times `(1 - surge_rate)` at the post-swap
-window position.
+Quote semantics: disabled pools/swaps, an inactive input token, or a frozen
+input/output SPL vault cannot trade. `amount == 0` returns a zero-output
+sentinel on otherwise available directions. Window, LP-balance and routing
+limits produce a **partial fill** (`not_enough_liquidity = true`, `amount` =
+the supported input, `expected_output` = exact output at that amount). The
+caller must request that returned amount when building the executed swap;
+`generate_swap_instruction` preserves its input request, as Titan requires.
+`minimum_amount_out` is 0. The local router template does not enforce a
+route-level minimum output. Production integration must separately confirm
+where the user's minimum received amount is enforced on-chain; output parity
+tests do not validate that protection.
+
+**Surge routing policy:** the exact contract port still calculates the full
+four-segment surge fee, but Titan quotes only the prefix where the contract
+charges zero surge. This replaces the net-output-peak heuristic: real downward
+output steps can occur before that peak, so a positive marginal price cannot
+honestly represent the full curve. With `cap` and `before` resolved by the
+contract's window transition at the refreshed Clock, the additional gross
+input limit is
+
+```text
+max(0, floor((cap * (threshold + 1) - 1) / 10000) - before)
+```
+
+for a nonzero cap and an enabled surge curve with `threshold < 10000`.
+This includes the last zero-fee integer fill cell. Cap zero permits no fill;
+disabled caps/curves and threshold 10000 impose no additional surge limit.
+The LP-balance limit can reduce the amount further. Beyond this prefix the
+adapter returns a partial fill; once the window is already in the surge zone,
+positive requests return zero fill and `bounds` has no tradable range. The
+reverse direction remains independently evaluated. `price` is the smooth
+weighted-curve derivative on this admitted prefix, with the ordinary input
+fee accounted for; it does not pretend to differentiate the surge segments.
+Full surge routing needs a compatible quote convention from Titan or a
+contract change. No on-chain code is changed by this policy.
+
+Every update reloads pool, mints, vaults and Clock and rebuilds the limits and
+curve parameters. A failed update invalidates quoting until a complete update
+succeeds. SPL Token and Token-2022 vault freeze is checked independently of
+the Coffer `is_active` flag: the former blocks either side of the frozen vault,
+whereas `is_active = false` only blocks selling that token. These checks cover
+pool vaults; user token accounts are not part of a venue snapshot.
 
 ### Test tiers
 
@@ -187,8 +218,8 @@ window position.
 make check-structure
 cargo test --release --test coffer_source_parity   # needs ../contracts or COFFER_CONTRACT_SRC=<program crate>/src
 
-# 2. no RPC: LiteSVM fixtures against the pinned production ELF
-cargo test --release --test coffer_fixtures -- --nocapture
+# 2. no RPC: routing policy, refresh/freeze and exact pinned-ELF parity
+make test-coffer-offline
 
 # 3. RPC-gated: the shared suite on live pools, and the route program
 export SOLANA_RPC_URL=https://...
@@ -214,7 +245,7 @@ Token-2022 mint), `CSgrE…` (9 tokens; slot 6 has a LIVE 10% sell-off cap with 
 80% → 25% surge curve), `BN4wp…` (80/20 weights), `AL4yx…` (LP balance far
 below the virtual balance). The route simulation uses `5dDez…` and `BN4wp…`.
 
-### Measured
+### Earlier measurements (before the conservative surge policy)
 
 - Quote latency (Apple M-series, `--release`): ~0.2 µs for a plain quote,
   ~0.5 µs on a fixture grid, ~0.7 µs with the cap and surge fee active
@@ -239,10 +270,14 @@ below the virtual balance). The route simulation uses `5dDez…` and `BN4wp…`.
   `atol = (2 + price_a) / (b - a)` — every one of the 88 directions passes with
   zero violations (`examples/mvt_diag.rs`). The Raydium reference is unaffected
   only because its output/input atom ratio is ~1.4.
-- The surge fee on-chain is a 4-segment, ceil-per-segment charge (conservative
-  by construction); `price` is the derivative of the continuous model. The
-  residual beyond the fee-rounding slack measured 7.3e-5 on the worst fixture
-  (`pricing_invariants_under_surge_with_residual_report`).
+- Full surge-fee swaps are intentionally outside the Titan routing domain.
+  The previous peak/continuous-price approximation did not satisfy the
+  pricing interface, including on inputs before the estimated peak. Tests
+  reproduce the actual output declines against the pinned ELF and check that
+  those inputs are excluded. Separate raw-port tests still exercise every
+  surge shape, compare exact payouts and compare the complete post-swap pool
+  account. Restricting surge does not remove the input-fee rounding limitation
+  described above; the shared pricing tolerances have not been relaxed.
 - The window arithmetic uses the Clock sysvar captured at `update_state` (the
   sysvar is in `get_required_pubkeys_for_update`, so it refreshes with the
   pool). Without a refresh between the quote and the landing block, the
@@ -329,6 +364,12 @@ low/mid/high, kink)`; see `CASES` in `src/bin/local_stand.rs`):
 Results of the last clean run (`scripts/local-stand/results/`, reproduced by
 `up.sh && run-matrix.sh`; 32 pools, 4 mints):
 
+These measurements predate the conservative surge routing policy. They
+validate the contract port and the previous integration, not full-surge
+availability in the current adapter. Contract-focused stand scenarios use
+explicit raw-port parity; routing checks use the restricted venue quotes.
+The current offline regressions are `coffer_fixtures` and `coffer_vault_freeze`.
+
 | tier | result |
 | --- | --- |
 | 1 shared suite | 19 static pools × 8 tests: everything passes except `mean_value_theorem` on the 17 pools that have a USDC → BONK direction (see below); `construction` also passes under the allocation guard |
@@ -349,14 +390,16 @@ switches; `add_liquidity` / `remove_liquidity` scale balances AND the window.
 Tier 5 (`tests/local_stand_range_manager.rs`) drives every one of these on the
 validator and asserts exact parity after each move. The review conclusions:
 
-- **State freshness.** `update_state` re-reads the pool account, every mint
-  and the Clock sysvar on each refresh and rebuilds the per-direction curve
+- **State freshness.** `update_state` re-reads the pool account, every mint,
+  every vault and the Clock sysvar on each refresh and rebuilds the per-direction curve
   parameters (`rebuild_directions`) from that fresh pool; nothing used by
   `quote` is cached across refreshes (no lazy fields; `Clone` is field-wise).
   The only value fixed at construction is the token set
   (`required_state_pubkeys`, `index_of`, `vault()`), which no instruction of
   the contract can change after `initialize_pool`; `update_state` rejects a
-  pool whose mints differ from the ones it was built from.
+  pool whose mints or token programs differ from the ones it was built from.
+  Refresh failure leaves the venue uninitialized until a complete snapshot is
+  accepted; frozen vaults remain valid state and disable only affected pairs.
 - **Declared directions.** `directions_num` returns every ordered pair of
   slots and nothing else. Titan documents it as the venue's *declared*
   directions, so a router may evaluate it once at registration; a filter on
@@ -380,33 +423,15 @@ validator and asserts exact parity after each move. The review conclusions:
   leaves the window untouched (fill accounting is in input atoms) and changes
   the curve, the spot price (`w_in / w_out` enters the derivative) and the
   surge segment outputs; all are recomputed from the refreshed pool.
-- **Net output is not monotone under the surge; the quotable domain ends at
-  its peak.** The contract charges the surge on four segments of the taxed
-  span at each segment's average rate (quantised to 0.01%), re-partitioned
-  for every request size. In the continuous model the net marginal rate
-  `f'(x)·(1 - rate)` is never negative, but the segmented charge can grow
-  faster than the curve pays out once the output is front-loaded: at 95/5
-  weights, zero swap fee, cap 50% and a 0 → 25% curve the user receives
-  963 537 089 473 atoms for 4e11 in but 960 973 264 083 for 4.9e11 (a larger
-  input pays 2.6e9 atoms less). Titan requires `f` non-decreasing and
-  `price` positive, so for every surge-limited direction `update_state`
-  locates the input at which the net output peaks (ternary search on the
-  exact port, ~150 quotes per direction per refresh) and the venue ends the
-  quotable domain there: requests past it are partial fills at the peak,
-  `bounds` stops there, and every partial-fill path (window cap, LP balance,
-  peak) sizes the fill through one function so the reported amount does not
-  depend on which limit the request tripped. Measured
-  (`surge_net_output_peak_ends_the_quotable_domain`): the domain ends at
-  77.2% of the cap (95/5, 0 → 25%) and 53.6% (95/5, 0 → 100%), while at
-  50/50 and 5/95 the whole window stays quotable (the net output at the cap
-  is within two rate quanta of its maximum; the domain limit is the far end
-  of that plateau, still short of the point where the rate reaches 100%);
-  the limit executes exactly on-chain. Residual: below the peak the
-  net output carries a sawtooth of one rate quantum on a segment's output
-  (measured worst 6.5e-5 relative at 95/5, invisible at 50/50 on the stand's
-  random-sample `monotone` runs) that no off-chain quote can remove while
-  staying exact; the shared suite's strict `monotone` can trip on it at
-  lopsided weights with steep curves.
+- **Surge domain.** The contract charges four moving segments of the taxed
+  span. Their quantized average rates can produce downward output steps well
+  before the maximum payout. The adapter therefore uses the exact zero-surge
+  prefix described above, recalculated on every refresh, and one shared limit
+  for full/partial quotes and `bounds`. There is no peak search or tolerance
+  extension. `contract_output_declines_are_excluded_from_titan_quotes`
+  reproduces both a broad decline and a sharp valid 1% kink in the pinned ELF;
+  `zero_surge_domain_satisfies_pricing_invariants` checks the retained range
+  with the shared price tolerance, isolating surge from input-fee rounding.
 - **Clock staleness** (a quote at clock `t`, the transaction landing at
   `t' > t` with no refresh in between). The pool state being unchanged, only
   the window position differs: (a) inside a window the carry-over decays, the
@@ -429,10 +454,13 @@ validator and asserts exact parity after each move. The review conclusions:
   post-rotation state is also unknowable exactly: the snapshot it takes is
   the live vb at landing time, which other swaps move), would break the
   exact-parity contract the suite checks, and would still not cover a
-  transaction landing later than the horizon. The exposure is bounded by
-  the route-level `minimum_amount_out` and removed by refreshing per slot:
-  keep the Clock sysvar (already in `get_required_pubkeys_for_update`)
-  refreshed with the pool. Note that the template's `RpcClientCache` keeps
+  transaction landing later than the horizon. Refreshing per slot reduces
+  stale-state exposure but cannot guarantee the landing state. Keep the Clock
+  sysvar (already in `get_required_pubkeys_for_update`) refreshed with the pool.
+  A route-level minimum-output check is required to reject execution below
+  the user's accepted output. That check is absent from this local router
+  template; its presence in Titan's production transaction must be confirmed.
+  Note that the template's `RpcClientCache` keeps
   positive entries forever, so a caller must `reset_cache` or use a fresh
   cache before each refresh, otherwise `update_state` re-decodes the same
   pool and clock.

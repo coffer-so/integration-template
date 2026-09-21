@@ -5,8 +5,8 @@
 //! - `5dDez…` — 4 tokens, equal weights, one Token-2022 mint, range manager on;
 //! - `CSgrE…` — 9 tokens (72 directions), uneven weights, and token slot 6
 //!   has a LIVE sell-off cap (10% / window) with a surge curve (80% → 25%),
-//!   so the cap, the partial-fill path and the surge fee run against the
-//!   production program;
+//!   so the cap and conservative surge-free partial-fill limit run against
+//!   the production program; full surge parity lives in coffer_fixtures;
 //! - `BN4wp…` — 2 tokens, 80/20 weights;
 //! - `AL4yx…` — 2 tokens whose LP-owned balance is tiny next to the virtual
 //!   balance, so the upper bound is set by `AmountOutExceedsBalance`.

@@ -12,8 +12,9 @@ const SWAP_DISCRIMINATOR: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 /// (`CofferVenue::generate_swap_instruction`): pool(w), mint_in, mint_out,
 /// TitanPDA's input ATA(w), TitanPDA's output ATA(w), vault_in(w),
 /// vault_out(w), TitanPDA (signer via seeds), token_program_in,
-/// token_program_out. `minimum_amount_out` is 0 — the router checks slippage
-/// on the whole route.
+/// token_program_out. `minimum_amount_out` is 0. This local router template
+/// has no route-level minimum-output check; a production route must provide
+/// that protection separately.
 pub fn swap(
     token_in_index: u8,
     token_out_index: u8,

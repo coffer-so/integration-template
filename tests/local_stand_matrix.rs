@@ -9,7 +9,9 @@
 //!   the Titan router program for every direction of every static pool at
 //!   several sizes and compares the user's ATA delta AND the post-swap pool
 //!   account with the venue's quote / `apply_swap`;
-//! - `dynamic_*` fills windows in chunks (direct swaps and routed swaps),
+//! - `dynamic_*` uses the raw contract port to fill entire windows, including
+//!   surge regions outside the adapter's supported domain (direct and routed
+//!   swaps). It separately checks the adapter's zero-surge boundary and
 //!   proves the venue reports a full window as unavailable while the program
 //!   reverts with `MaxSelloffExceeded`, waits for a real-time rotation on a
 //!   20-second window, toggles `set_token_active` / `set_swaps_enabled` /
@@ -55,7 +57,7 @@ fn mvt_residual(venue: &CofferVenue) -> (usize, usize, f64, f64) {
     let mut template_violations = 0;
     let mut input_aware_violations = 0;
     let mut worst: f64 = 0.0;
-    let mut worst_surge: f64 = 0.0;
+    let mut worst_after_rounding: f64 = 0.0;
     for (i, j) in venue.directions_num() {
         let Ok((lb, ub)) = venue.bounds(i, j) else {
             continue;
@@ -81,7 +83,11 @@ fn mvt_residual(venue: &CofferVenue) -> (usize, usize, f64, f64) {
                 continue;
             }
             let (qa, qb) = (q(a), q(b));
-            if qb.expected_output <= qa.expected_output {
+            assert!(
+                qb.expected_output >= qa.expected_output,
+                "output fell on [{a}, {b}]"
+            );
+            if qb.expected_output == qa.expected_output {
                 continue;
             }
             let chord = (qb.expected_output - qa.expected_output) as f64 / (b - a) as f64;
@@ -96,7 +102,7 @@ fn mvt_residual(venue: &CofferVenue) -> (usize, usize, f64, f64) {
             let under = ((qb.price * (1.0 - 1e-5) - atol2) - chord) / qb.price;
             if over > 0.0 || under > 0.0 {
                 input_aware_violations += 1;
-                worst_surge = worst_surge.max(over).max(under);
+                worst_after_rounding = worst_after_rounding.max(over).max(under);
             }
         }
     }
@@ -104,7 +110,7 @@ fn mvt_residual(venue: &CofferVenue) -> (usize, usize, f64, f64) {
         template_violations,
         input_aware_violations,
         worst,
-        worst_surge,
+        worst_after_rounding,
     )
 }
 
@@ -162,14 +168,14 @@ async fn shared_suite(only: Option<&str>) {
                 }
             }
         }
-        let quotable_only = !pool.inactive_tokens.is_empty() || switched_off;
+        let quotable_only = quotable.len() != dirs.len();
         let mut results = Vec::new();
         for t in &tests {
             results.push(run_suite_test(t, address, quotable_only).await);
         }
-        let (tv, iv, worst, worst_surge) = mvt_residual(&venue);
+        let (tv, iv, worst, worst_after_rounding) = mvt_residual(&venue);
         let note = format!(
-            "dirs={} quotable={} mvt: template_violations={tv} (worst {worst:.2e}) beyond_input_atom_slack={iv} (worst {worst_surge:.2e})",
+            "dirs={} quotable={} mvt: template_violations={tv} (worst {worst:.2e}) beyond_input_atom_slack={iv} (worst {worst_after_rounding:.2e})",
             dirs.len(),
             quotable.len()
         );
@@ -285,6 +291,9 @@ async fn real_routed_transactions() {
             // Earlier samples may have filled this input token's window, and
             // a deactivated input token is declared but unquotable.
             venue = stand.venue(address).await;
+            if venue.pool().tokens[i as usize].config.is_active {
+                assert_adapter_domain(&venue, i, j);
+            }
             let Ok((lb, ub)) = venue.bounds(i, j) else {
                 exhausted_directions += 1;
                 continue;
@@ -382,7 +391,7 @@ async fn fill_window(
 ) -> (u64, Vec<Parity>, u64) {
     let pool: Pubkey = stand.pool(case).address.parse().unwrap();
     let mut venue = stand.venue(pool).await;
-    let probe = headroom_of(&venue, 0, 1);
+    let probe = contract_headroom_of(&venue, 0, 1);
     assert!(
         probe.not_enough_liquidity,
         "{case}: probe should exceed the cap"
@@ -394,15 +403,19 @@ async fn fill_window(
     let mut sold = 0u64;
     loop {
         venue = stand.venue(pool).await;
-        let head = headroom_of(&venue, 0, 1).amount;
+        let head = contract_headroom_of(&venue, 0, 1).amount;
         if head == 0 {
             break;
         }
         let amount = chunk.min(head);
-        let p = stand.parity_swap(&venue, 0, 1, amount, routed).await;
-        if p.amount_executed == 0 {
-            break; // the venue refuses the remaining dust (zero output)
-        }
+        assert_adapter_domain(&venue, 0, 1);
+        let p = stand
+            .contract_parity_swap(&venue, 0, 1, amount, routed)
+            .await;
+        assert_eq!(
+            p.amount_executed, amount,
+            "raw contract swap executes the requested size"
+        );
         assert!(p.ok(), "{case}: chunk {amount} mismatch: {p:?}");
         if !p.exact() {
             println!(
@@ -413,7 +426,8 @@ async fn fill_window(
         sold += p.amount_executed;
         log.push(p);
     }
-    // Window full (or only dust the venue refuses because it would pay 0).
+    // The raw contract path fills the full window, including zero-output
+    // atoms at a 100% surge rate; adapter support is checked separately.
     venue = stand.venue(pool).await;
     let bucket_after_sells = venue.pool().tokens[1].dynamics.protocol_fees_owed;
     let raw_head = selloff_headroom(venue.pool(), 0, venue.now())
@@ -444,30 +458,7 @@ async fn fill_window(
         Err(ErrorCode::MaxSelloffExceeded.code()),
         "{case}"
     );
-    if raw_head > 0 {
-        // The dust the venue refuses is accepted by the program but pays 0
-        // (100% surge at full fill); after it the cap is exactly reached.
-        let (out_mint, out_tp) = (venue.get_token(1).unwrap().pubkey, spl_token::ID);
-        let before = stand.token_balance(&out_mint, &out_tp).await;
-        let ix = venue
-            .generate_swap_instruction(stand.request(&venue, 0, 1, raw_head), stand.wallet.pubkey())
-            .unwrap();
-        stand.send(&[ix]).await.unwrap();
-        let paid = stand.token_balance(&out_mint, &out_tp).await - before;
-        println!(
-            "  {case}: remaining {raw_head} atoms refused by the venue (zero output); on-chain they paid {paid} atoms"
-        );
-        venue = stand.venue(pool).await;
-        let ix = venue
-            .generate_swap_instruction(stand.request(&venue, 0, 1, 1), stand.wallet.pubkey())
-            .unwrap();
-        assert_eq!(
-            stand.send(&[ix]).await,
-            Err(ErrorCode::MaxSelloffExceeded.code()),
-            "{case}"
-        );
-        sold += raw_head;
-    }
+    assert_eq!(raw_head, 0, "{case}: the raw contract window must be full");
     // Buy side unaffected by BONK's cap.
     let (lb, ub) = venue.bounds(1, 0).unwrap();
     let p = stand
@@ -490,6 +481,10 @@ async fn dynamic_window_filling_direct_swaps() {
         let after = stand.pool_state(pool).await;
         let surge_total: u64 = log.iter().map(|p| p.surge_fee).sum();
         let accrued = bucket_after_sells - before.tokens[1].dynamics.protocol_fees_owed;
+        assert!(
+            surge_total > 0,
+            "{case}: full contract sequence must cover surge fees"
+        );
         // The LP swap-fee protocol cut lands on the INPUT token; the surge fee
         // is the only thing that lands on the OUTPUT token's bucket.
         assert_eq!(
@@ -518,6 +513,7 @@ async fn dynamic_window_filling_routed() {
     };
     println!("\n== dynamic: window filling through the Titan router (config b, kink at 50%) ==");
     let (sold, log, _) = fill_window(&stand, "dyn_router", true, 10).await;
+    assert!(log.iter().any(|p| p.surge_fee > 0));
     for (k, p) in log.iter().enumerate() {
         println!(
             "  chunk {k}: in {} out {} surge {}",
@@ -527,8 +523,8 @@ async fn dynamic_window_filling_routed() {
     println!("  sold {sold}; {} routed chunks all exact", log.len());
 }
 
-/// 100% surge above the threshold: the venue reports the exhaustion point as
-/// the fillable amount; the program pays nothing above it.
+/// 100% surge above the threshold: the venue admits the last untaxed
+/// quantized fill cell; a subsequent raw contract swap pays nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dynamic_full_fee_exhaustion_point() {
     let Some(stand) = stand_or_skip("dynamic_full_fee_exhaustion_point").await else {
@@ -538,12 +534,12 @@ async fn dynamic_full_fee_exhaustion_point() {
     let pool: Pubkey = stand.pool(case).address.parse().unwrap();
     let venue = stand.venue(pool).await;
     let cap = venue.pool().tokens[0].dynamics.virtual_balance / 10;
-    let threshold_point = cap * 8 / 10;
+    let threshold_point = ((cap as u128 * 8_001 - 1) / 10_000) as u64;
     let q = venue.quote(stand.request(&venue, 0, 1, cap)).unwrap();
     assert!(q.not_enough_liquidity, "{q:?}");
     assert_eq!(
         q.amount, threshold_point,
-        "exhaustion point is the 80% threshold"
+        "exhaustion point is the end of the untaxed 80% fill cell"
     );
     assert!(q.price > 0.0);
     let (_, ub) = venue.bounds(0, 1).unwrap();
@@ -557,7 +553,7 @@ async fn dynamic_full_fee_exhaustion_point() {
         .await;
     assert!(p.ok(), "{p:?}");
     // Now sell MORE than the quote admits (10% of the cap past the threshold)
-    // for real: the program accepts it and pays only the below-threshold output.
+    // for real: the program accepts it and charges all of its output as surge.
     let venue = stand.venue(pool).await;
     let more = cap / 10;
     let q = venue.quote(stand.request(&venue, 0, 1, more)).unwrap();
@@ -565,13 +561,9 @@ async fn dynamic_full_fee_exhaustion_point() {
         q.not_enough_liquidity && q.amount == 0 && q.expected_output == 0,
         "{q:?}"
     );
-    let (out_mint, out_tp) = (venue.get_token(1).unwrap().pubkey, spl_token::ID);
-    let before = stand.token_balance(&out_mint, &out_tp).await;
-    let ix = venue
-        .generate_swap_instruction(stand.request(&venue, 0, 1, more), stand.wallet.pubkey())
-        .unwrap();
-    stand.send(&[ix]).await.unwrap();
-    let received = stand.token_balance(&out_mint, &out_tp).await - before;
+    let raw = stand.contract_parity_swap(&venue, 0, 1, more, false).await;
+    assert!(raw.ok(), "full-fee contract parity: {raw:?}");
+    let received = raw.received;
     println!(
         "\n== dynamic: 100% surge (dyn_d) == exhaustion point {threshold_point} executed exactly; selling {more} more on-chain paid {received} atoms (quote: 0 fillable, 0 output)"
     );
@@ -616,16 +608,16 @@ async fn dynamic_real_time_rotation() {
         tokio::time::sleep(Duration::from_secs((wake - now) as u64)).await;
     }
     venue = stand.venue(pool).await;
-    assert!(
-        venue.bounds(0, 1).is_ok(),
-        "the quotable range must come back after one period"
-    );
-    let head = headroom_of(&venue, 0, 1).amount;
+    // The contract has new capacity after one rotation even if the decaying
+    // carry-over still places it inside the surge zone. Adapter availability
+    // follows its stricter zero-surge boundary.
+    assert_adapter_domain(&venue, 0, 1);
+    let head = contract_headroom_of(&venue, 0, 1).amount;
     assert!(
         head > 0 && head < sold,
         "after one rotation the carry-over leaves partial headroom: {head} vs sold {sold}"
     );
-    let p = stand.parity_swap(&venue, 0, 1, head, false).await;
+    let p = stand.contract_parity_swap(&venue, 0, 1, head, false).await;
     assert!(p.ok(), "sell exactly the post-rotation headroom: {p:?}");
     venue = stand.venue(pool).await;
     let ix = venue
@@ -651,10 +643,15 @@ async fn dynamic_real_time_rotation() {
         tokio::time::sleep(Duration::from_secs((wake - now) as u64)).await;
     }
     venue = stand.venue(pool).await;
-    let head2 = headroom_of(&venue, 0, 1).amount;
+    let head2 = contract_headroom_of(&venue, 0, 1).amount;
     let cap_now = venue.pool().tokens[0].dynamics.virtual_balance / 10;
     println!("  after two periods: headroom {head2} == cap {cap_now} (fresh window)");
     assert_eq!(head2, cap_now);
+    assert_adapter_domain(&venue, 0, 1);
+    assert!(
+        venue.bounds(0, 1).is_ok(),
+        "zero-surge domain recovers in a fresh window"
+    );
     let p = stand.parity_swap(&venue, 0, 1, cap_now / 3, false).await;
     assert!(p.ok(), "{p:?}");
 }
